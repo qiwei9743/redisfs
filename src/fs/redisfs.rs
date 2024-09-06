@@ -39,7 +39,18 @@ impl RedisFs {
 
         // 合并两个 Drain
         let drain = slog::Duplicate::new(drain_term, drain_file).fuse();
-        let drain = slog::LevelFilter::new(drain, slog::Level::Debug).fuse();
+        
+        let log_level = std::env::var("REDISFS_LOG_LEVEL").unwrap_or_else(|_| "DEBUG".to_string());
+        let log_level = match log_level.as_str() {
+            "CRITICAL" => slog::Level::Critical,
+            "ERROR" => slog::Level::Error,
+            "WARNING" => slog::Level::Warning,
+            "INFO" => slog::Level::Info,
+            "DEBUG" => slog::Level::Debug,
+            "TRACE" => slog::Level::Trace,
+            _ => slog::Level::Debug,
+        };
+        let drain = slog::LevelFilter::new(drain, log_level).fuse();
         
         let logger = slog::Logger::root(drain, o!());
 
