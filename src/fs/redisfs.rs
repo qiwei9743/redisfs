@@ -4,7 +4,9 @@ use redis;
 use std::time::{Duration, UNIX_EPOCH};
 use std::ffi::OsStr;
 use libc::{ENOENT, EIO};
-use redis::Commands;
+use redis::aio::ConnectionManager;
+use redis::AsyncCommands;
+use tokio::sync::Mutex;
 use slog::{debug, warn, error, Logger, o, Drain};
 use slog_term;
 use slog_async;
@@ -12,15 +14,24 @@ use std::io::{self, Write};
 use snafu::{ResultExt, Whatever, Snafu};
 use fuser::{FileAttr, FileType};
 use slog_envlogger;
+use std::sync::Arc;
 
 pub struct RedisFs {
-    redis_client: redis::Client,
-    pub logger: Logger,
+    redis_client: ConnectionManager,
+    pub logger: Arc<Logger>,
 }
 
+impl Clone for RedisFs {
+    fn clone(&self) -> Self {
+        RedisFs {
+            redis_client: self.redis_client.clone(),
+            logger: Arc::clone(&self.logger),
+        }
+    }
+}
 
 impl RedisFs {
-    pub fn new(redis_url: &str) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(redis_url: &str) -> Result<Self, Box<dyn Error>> {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -44,41 +55,37 @@ impl RedisFs {
         let drain = slog_envlogger::new(drain);
         
         // 创建根日志记录器
-        let logger = slog::Logger::root(drain, o!("module" => "redisfs"));
+        let logger = Arc::new(slog::Logger::root(drain, o!("module" => "redisfs")));
 
         let client = redis::Client::open(redis_url)?;
+        let connection_manager = ConnectionManager::new(client).await?;
+        let redis_client = connection_manager;
 
-        
         let fs = RedisFs { 
-            redis_client: client,
+            redis_client,
             logger,
         };
-        fs.ensure_root_inode()?;
+        fs.ensure_root_inode().await?;
         Ok(fs)
     }
 
-    fn ensure_root_inode(&self) -> Result<(), Box<dyn Error>> {
-        let mut conn = self.redis_client.get_connection()?;
+    async fn ensure_root_inode(&self) -> Result<(), Box<dyn Error>> {
+        let mut conn = self.redis_client.clone();
         let root_key = "inode:1";
         
-        // 检查根inode是否存在
-        if !conn.exists(root_key)? {
+        if !conn.exists(root_key).await? {
             debug!(self.logger, "根inode不存在，正在创建");
             
-            // 创建根目录的属性
             let root_attr = vec![
                 ("size", "0"),
                 ("mode", "0755"),
                 ("uid", "0"),
                 ("gid", "0"),
-                ("filetype", "3"), // 3 表示目录
+                ("filetype", "3"),
             ];
             
-            // 将根目录属性存储到Redis
-            conn.hset_multiple(root_key, &root_attr)?;
-            
-            // 设置next_inode为2
-            conn.set("next_inode", 2)?;
+            conn.hset_multiple(root_key, &root_attr).await?;
+            conn.set("next_inode", 2).await?;
             
             debug!(self.logger, "根inode创建成功，next_inode设置为2");
         } else {
@@ -87,17 +94,15 @@ impl RedisFs {
         
         Ok(())
     }
-    pub fn set_attr(&self, ino: u64, attr: &FileAttr) -> Result<(), i32> {
-        let mut conn = self.redis_client.get_connection().map_err(|e| {
-            slog::error!(self.logger, "无法连接到Redis"; "错误" => ?e);
-            EIO
-        })?;
+
+    pub async fn set_attr(&self, ino: u64, attr: &FileAttr) -> Result<(), i32> {
+        let mut conn = self.redis_client.clone();
 
         let attr_key = format!("inode:{}", ino);
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-        let _: () = redis::pipe()
-            .hset(&attr_key, "ino", ino)
+        let mut pipe = redis::pipe();
+        pipe.hset(&attr_key, "ino", ino)
             .hset(&attr_key, "size", attr.size)
             .hset(&attr_key, "mode", attr.perm)
             .hset(&attr_key, "uid", attr.uid)
@@ -109,22 +114,18 @@ impl RedisFs {
             .hset(&attr_key, "filetype", match attr.kind {
                 fuser::FileType::Directory => 3,
                 _ => 4,
-            })
-            .query(&mut conn)
-            .map_err(|e| {
-                slog::error!(self.logger, "无法设置inode属性"; "inode" => ino, "错误" => ?e);
-                EIO
-            })?;
+            });
 
-        slog::debug!(self.logger, "成功设置inode属性"; "inode" => ino, "attr" => ?attr);
+        pipe.query_async(&mut conn).await.map_err(|e| {
+            slog::error!(self.logger, "无法设置inode属性"; "inode" => ino, "错误" => ?e);
+            EIO
+        })?;
+
         Ok(())
     }
 
-    pub fn set_attr_opt(&mut self, ino: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, flags: Option<u32>) -> Result<FileAttr, i32> {
-        let mut conn = self.redis_client.get_connection().map_err(|e| {
-            slog::error!(self.logger, "无法连接到Redis"; "错误" => ?e, "函数" => "set_attr");
-            EIO
-        })?;
+    pub async fn set_attr_opt(&self, ino: u64, mode: Option<u32>, uid: Option<u32>, gid: Option<u32>, size: Option<u64>, flags: Option<u32>) -> Result<FileAttr, i32> {
+        let mut conn = self.redis_client.clone();
 
         let attr_key = format!("inode:{}", ino);
         let mut pipe = redis::pipe();
@@ -148,23 +149,20 @@ impl RedisFs {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         pipe.hset(&attr_key, "ctime", now);
 
-        pipe.query(&mut conn).map_err(|e| {
+        pipe.query_async(&mut conn).await.map_err(|e| {
             slog::error!(self.logger, "无法设置inode属性"; "inode" => ino, "错误" => ?e, "函数" => "set_attr");
             EIO
         })?;
 
         // 获取更新后的属性
-        self.get_attr(ino)
+        self.get_attr(ino).await
     }
 
-    pub fn get_attr(&self, ino: u64) -> Result<FileAttr, i32> {
-        let mut conn = self.redis_client.get_connection().map_err(|e| {
-            slog::error!(self.logger, "无法连接到Redis"; "错误" => ?e);
-            EIO
-        })?;
+    pub async fn get_attr(&self, ino: u64) -> Result<FileAttr, i32> {
+        let mut conn = self.redis_client.clone();
 
         let attr_key = format!("inode:{}", ino);
-        let attr: std::collections::HashMap<String, String> = conn.hgetall(&attr_key).map_err(|e| {
+        let attr: std::collections::HashMap<String, String> = conn.hgetall(&attr_key).await.map_err(|e| {
             slog::error!(self.logger, "无法获取inode属性"; "inode" => ino, "错误" => ?e);
             EIO
         })?;
@@ -200,21 +198,15 @@ impl RedisFs {
         Ok(attr)
     }
 
-    pub fn lookup(&mut self, parent: u64, name: &OsStr) -> Result<FileAttr, i32> {
-        let mut conn = match self.redis_client.get_connection() {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!(self.logger, "Failed to connect to Redis"; "error" => ?e);
-                return Err(ENOENT);
-            }
-        };
+    pub async fn lookup(&self, parent: u64, name: &OsStr) -> Result<FileAttr, i32> {
+        let mut conn = self.redis_client.clone();
 
         let parent_key = format!("inode:{}:children", parent);
-        let child_ino: Result<u64, redis::RedisError> = conn.hget(&parent_key, name.to_str().unwrap());
+        let child_ino: Result<u64, redis::RedisError> = conn.hget(&parent_key, name.to_str().unwrap()).await;
 
         match child_ino {
             Ok(ino) => {
-                match self.get_attr(ino) {
+                match self.get_attr(ino).await {
                     Ok(attr) => Ok(attr),
                     Err(e) => {
                         error!(self.logger, "Failed to get attributes"; "inode" => ino, "error" => ?e);
@@ -226,17 +218,11 @@ impl RedisFs {
         }
     }
 
-    pub fn create_file(&mut self, parent: u64, name: &OsStr, mode: u32, umask: u32, flags: i32, uid: u32, gid: u32) -> Result<(u64, FileAttr), i32> {
-        let mut conn = match self.redis_client.get_connection() {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!(self.logger, "Failed to connect to Redis"; "error" => ?e);
-                return Err(EIO);
-            }
-        };
+    pub async fn create_file(&self, parent: u64, name: &OsStr, mode: u32, umask: u32, flags: i32, uid: u32, gid: u32) -> Result<(u64, FileAttr), i32> {
+        let mut conn = self.redis_client.clone();
 
         // Generate new inode number
-        let new_ino: u64 = conn.incr("next_inode", 1).map_err(|e| {
+        let new_ino: u64 = conn.incr("next_inode", 1).await.map_err(|e| {
             error!(self.logger, "Failed to generate new inode number"; "error" => ?e);
             EIO
         })?;
@@ -263,8 +249,8 @@ impl RedisFs {
 
         // Store the new file's attributes in Redis
         let attr_key = format!("inode:{}", new_ino);
-        let _: () = redis::pipe()
-            .hset(&attr_key, "ino", new_ino)
+        let mut pipe = redis::pipe();
+        pipe.hset(&attr_key, "ino", new_ino)
             .hset(&attr_key, "size", 0)
             .hset(&attr_key, "mode", mode)
             .hset(&attr_key, "umask", umask)
@@ -274,16 +260,16 @@ impl RedisFs {
             .hset(&attr_key, "atime", now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
             .hset(&attr_key, "mtime", now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
             .hset(&attr_key, "ctime", now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
-            .hset(&attr_key, "crtime", now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs())
-            .query(&mut conn)
-            .map_err(|e| {
-                error!(self.logger, "Failed to store new file attributes"; "inode" => new_ino, "error" => ?e);
-                EIO
-            })?;
+            .hset(&attr_key, "crtime", now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+
+        pipe.query_async(&mut conn).await.map_err(|e| {
+            error!(self.logger, "Failed to store new file attributes"; "inode" => new_ino, "error" => ?e);
+            EIO
+        })?;
 
         // Add the new file to the parent directory
         let parent_key = format!("inode:{}:children", parent);
-        let _: () = conn.hset(&parent_key, name.to_str().unwrap(), new_ino).map_err(|e| {
+        conn.hset(&parent_key, name.to_str().unwrap(), new_ino).await.map_err(|e| {
             slog::error!(self.logger, "Failed to add new file to parent directory"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e);
             EIO
         })?;
@@ -291,14 +277,12 @@ impl RedisFs {
         slog::info!(self.logger, "Successfully created new file"; "parent_inode" => parent, "file_name" => ?name, "new_inode" => new_ino);
         Ok((new_ino, attr))
     }
-    pub fn create_directory(&mut self, parent: u64, name: &OsStr, mode: u32, umask: u32, uid: u32, gid: u32) -> Result<(u64, FileAttr), i32> {
-        let mut conn = self.redis_client.get_connection().map_err(|e| {
-            slog::error!(self.logger, "Failed to get Redis connection"; "error" => ?e, "function" => "create_directory");
-            EIO
-        })?;
+
+    pub async fn create_directory(&self, parent: u64, name: &OsStr, mode: u32, umask: u32, uid: u32, gid: u32) -> Result<(u64, FileAttr), i32> {
+        let mut conn = self.redis_client.clone();
 
         // Generate new inode number
-        let new_ino: u64 = conn.incr("next_inode", 1).map_err(|e| {
+        let new_ino: u64 = conn.incr("next_inode", 1).await.map_err(|e| {
             slog::error!(self.logger, "Failed to generate new inode number"; "error" => ?e, "function" => "create_directory");
             EIO
         })?;
@@ -324,54 +308,51 @@ impl RedisFs {
         };
 
         // Set attributes for the new directory
-        self.set_attr(new_ino, &attr).map_err(|e| {
+        self.set_attr(new_ino, &attr).await.map_err(|e| {
             slog::error!(self.logger, "Failed to set new directory attributes"; "inode" => new_ino, "error" => ?e, "function" => "create_directory");
             EIO
         })?;
 
         // Add the new directory to the parent directory
         let parent_key = format!("inode:{}:children", parent);
-        let _: () = conn.hset(&parent_key, name.to_str().unwrap(), new_ino).map_err(|e| {
+        conn.hset(&parent_key, name.to_str().unwrap(), new_ino).await.map_err(|e| {
             slog::error!(self.logger, "Failed to add new directory to parent"; "parent_inode" => parent, "dir_name" => ?name, "error" => ?e, "function" => "create_directory");
             EIO
         })?;
 
         // Create . and .. entries for the new directory
         let children_key = format!("inode:{}:children", new_ino);
-        let _: () = redis::pipe()
-            .hset(&children_key, ".", new_ino)
-            .hset(&children_key, "..", parent)
-            .query(&mut conn)
-            .map_err(|e| {
-                slog::error!(self.logger, "Failed to create . and .. entries for new directory"; "inode" => new_ino, "error" => ?e, "function" => "create_directory");
-                EIO
-            })?;
+        let mut pipe = redis::pipe();
+        pipe.hset(&children_key, ".", new_ino)
+            .hset(&children_key, "..", parent);
+
+        pipe.query_async(&mut conn).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to create . and .. entries for new directory"; "inode" => new_ino, "error" => ?e, "function" => "create_directory");
+            EIO
+        })?;
 
         slog::info!(self.logger, "Successfully created new directory"; "parent_inode" => parent, "dir_name" => ?name, "new_inode" => new_ino, "function" => "create_directory");
         Ok((new_ino, attr))
     }
 
-    pub fn read_dir(&self, parent: u64, offset: i64) -> Result<Vec<(u64, std::ffi::OsString, FileAttr)>, i32> {
+    pub async fn read_dir(&self, parent: u64, offset: i64) -> Result<Vec<(u64, std::ffi::OsString, FileAttr)>, i32> {
         use std::ffi::OsString;
 
-        let mut conn = self.redis_client.get_connection().map_err(|e| {
-            slog::error!(self.logger, "Failed to connect to Redis"; "error" => ?e, "function" => "read_dir");
-            EIO
-        })?;
+        let mut conn = self.redis_client.clone();
 
         let children_key = format!("inode:{}:children", parent);
-        let children: Vec<(String, u64)> = conn.hgetall(&children_key).map_err(|e| {
+        let children: Vec<(String, u64)> = conn.hgetall(&children_key).await.map_err(|e| {
             slog::error!(self.logger, "Failed to read directory contents"; "parent_inode" => parent, "error" => ?e, "function" => "read_dir");
             EIO
         })?;
 
         let mut entries = Vec::new();
-        for (index, (name, ino)) in children.into_iter().enumerate().skip(offset as usize) {
-            match self.get_attr(ino) {
+        for (name, ino) in children.into_iter().skip(offset as usize) {
+            match self.get_attr(ino).await {
                 Ok(attr) => entries.push((ino, OsString::from(name), attr)),
                 Err(e) => {
                     slog::error!(self.logger, "Failed to get file attributes"; "inode" => ino, "error" => ?e, "function" => "read_dir");
-                    return Err(EIO);
+                    continue; // Skip this entry and continue processing others
                 }
             }
         }
@@ -379,20 +360,18 @@ impl RedisFs {
         slog::debug!(self.logger, "Successfully read directory contents"; "parent_inode" => parent, "entry_count" => entries.len(), "offset" => offset);
         Ok(entries)
     }
-    pub fn write_file(&mut self, ino: u64, offset: i64, data: &[u8]) -> Result<u32, i32> {
-        let mut conn = self.redis_client.get_connection().map_err(|e| {
-            slog::error!(self.logger, "连接Redis失败"; "错误" => ?e, "函数" => "write_file");
-            EIO
-        })?;
+
+    pub async fn write_file(&self, ino: u64, offset: i64, data: &[u8]) -> Result<u32, i32> {
+        let mut conn = self.redis_client.clone();
 
         let file_key = format!("inode:{}:data", ino);
-        let file_size: u64 = conn.get(&file_key).unwrap_or(0);
+        let file_size: u64 = conn.get(&file_key).await.unwrap_or(0);
 
         let new_size = std::cmp::max(file_size, (offset as u64) + (data.len() as u64));
         let mut file_content = vec![0u8; new_size as usize];
 
         if file_size > 0 {
-            let existing_content: Vec<u8> = conn.get(&file_key).map_err(|e| {
+            let existing_content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
                 slog::error!(self.logger, "读取文件内容失败"; "inode" => ino, "错误" => ?e, "函数" => "write_file");
                 EIO
             })?;
@@ -401,28 +380,24 @@ impl RedisFs {
 
         file_content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
 
-        conn.set(&file_key, &file_content).map_err(|e| {
+        conn.set(&file_key, &file_content).await.map_err(|e| {
             slog::error!(self.logger, "写入文件内容失败"; "inode" => ino, "错误" => ?e, "函数" => "write_file");
             EIO
         })?;
 
         // 更新文件大小
-        self.set_attr_opt(ino, None, None, None, Some(new_size), None)?;
+        self.set_attr_opt(ino, None, None, None, Some(new_size), None).await?;
 
         slog::debug!(self.logger, "成功写入文件"; "inode" => ino, "偏移量" => offset, "写入字节数" => data.len());
         Ok(data.len() as u32)
     }
 
-    pub fn read_file(&self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        let mut conn = self.redis_client.get_connection().map_err(|e| {
-            slog::error!(self.logger, "连接Redis失败"; "错误" => ?e, "函数" => "read_file");
-            EIO
-        })?;
+    pub async fn read_file(&self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        let mut conn = self.redis_client.clone();
 
         let file_key = format!("inode:{}:data", ino);
 
-
-        let content: Vec<u8> = conn.get(&file_key).map_err(|e| {
+        let content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
             slog::error!(self.logger, "读取文件内容失败"; "inode" => ino, "错误" => ?e, "函数" => "read_file");
             EIO
         })?;

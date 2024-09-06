@@ -1,7 +1,8 @@
 
 mod fs;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     env_logger::init();
 
     use fuser::MountOption;
@@ -12,7 +13,7 @@ fn main() {
     let redis_url = env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379".to_string());
 
     // 创建RedisFs实例
-    let redis_fs = match fs::redisfs::RedisFs::new(&redis_url) {
+    let redis_fs = match fs::redisfs::RedisFs::new(&redis_url).await {
         Ok(fs) => fs,
         Err(e) => {
             eprintln!("无法创建RedisFs实例: {}", e);
