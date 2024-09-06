@@ -29,18 +29,18 @@ impl Filesystem for RedisFs {
     ) {
         match self.set_attr_opt(ino, mode, uid, gid, size, flags) {
             Ok(attr) => {
-                slog::debug!(self.logger, "成功设置inode属性"; 
-                    "函数" => "setattr",
+                slog::debug!(self.logger, "Successfully set ino attributes"; 
+                    "function" => "setattr",
                     "ino" => ino,
                     "attr" => ?attr
                 );
                 reply.attr(&Duration::new(0, 0), &attr);
             },
             Err(error_code) => {
-                slog::error!(self.logger, "设置inode属性失败"; 
-                    "函数" => "setattr",
+                slog::error!(self.logger, "Failed to set ino attributes"; 
+                    "function" => "setattr",
                     "ino" => ino,
-                    "错误代码" => error_code
+                    "error_code" => error_code
                 );
                 reply.error(error_code);
             }
@@ -51,7 +51,7 @@ impl Filesystem for RedisFs {
         let attr = self.get_attr(ino);
         match attr {
             Ok(attr) => {
-                slog::debug!(self.logger, "Successfully retrieved inode attributes"; 
+                slog::debug!(self.logger, "Successfully retrieved ino attributes"; 
                     "function" => "getattr",
                     "ino" => ino,
                     "attr" => ?attr
@@ -59,7 +59,7 @@ impl Filesystem for RedisFs {
                 reply.attr(&Duration::new(0, 0), &attr);
             }
             Err(e) => {
-                slog::error!(self.logger, "Failed to retrieve inode attributes"; 
+                slog::error!(self.logger, "Failed to retrieve ino attributes"; 
                     "function" => "getattr",
                     "ino" => ino,
                     "error" => ?e
@@ -96,16 +96,16 @@ impl Filesystem for RedisFs {
             Ok((new_ino, attr)) => {
                 slog::debug!(self.logger, "Successfully created file"; 
                     "function" => "create",
-                    "parent_inode" => parent,
+                    "parent_ino" => parent,
                     "file_name" => ?name,
-                    "new_inode" => new_ino
+                    "new_ino" => new_ino
                 );
                 reply.created(&Duration::new(1, 0), &attr, 0, 0, 0);
             },
             Err(error_code) => {
                 slog::error!(self.logger, "Failed to create file"; 
                     "function" => "create",
-                    "parent_inode" => parent,
+                    "parent_ino" => parent,
                     "file_name" => ?name,
                     "error_code" => error_code
                 );
@@ -119,16 +119,16 @@ impl Filesystem for RedisFs {
             Ok((new_ino, attr)) => {
                 slog::debug!(self.logger, "Successfully created directory"; 
                     "function" => "mkdir",
-                    "parent_inode" => parent, 
+                    "parent_ino" => parent, 
                     "directory_name" => ?name, 
-                    "new_inode" => new_ino
+                    "new_ino" => new_ino
                 );
                 reply.entry(&Duration::new(1, 0), &attr, 0);
             },
             Err(error_code) => {
                 slog::error!(self.logger, "Failed to create directory"; 
                     "function" => "mkdir",
-                    "parent_inode" => parent, 
+                    "parent_ino" => parent, 
                     "directory_name" => ?name, 
                     "error_code" => error_code
                 );
@@ -141,7 +141,7 @@ impl Filesystem for RedisFs {
             Ok(entries) => {
                 let entries_len = entries.len();
                 for (i, (ino, name, attr)) in entries.into_iter().enumerate() {
-                    let offset = i as i64 + 1; // 偏移量从1开始
+                    let offset = i as i64 + 1; // Offset starts from 1
                     let kind = match attr.kind {
                         fuser::FileType::Directory => fuser::FileType::Directory,
                         _ => fuser::FileType::RegularFile,
@@ -150,18 +150,18 @@ impl Filesystem for RedisFs {
                         break;
                     }
                 }
-                slog::debug!(self.logger, "成功读取目录"; 
-                    "函数" => "readdir",
-                    "inode" => ino, 
-                    "条目数" => entries_len
+                slog::debug!(self.logger, "Successfully read directory"; 
+                    "function" => "readdir",
+                    "ino" => ino, 
+                    "entries_count" => entries_len
                 );
                 reply.ok();
             },
             Err(error_code) => {
-                slog::error!(self.logger, "读取目录失败"; 
-                    "函数" => "readdir",
-                    "inode" => ino, 
-                    "错误代码" => ?error_code
+                slog::error!(self.logger, "Failed to read directory"; 
+                    "function" => "readdir",
+                    "ino" => ino, 
+                    "error_code" => ?error_code
                 );
                 reply.error(error_code);
             }
@@ -181,20 +181,20 @@ impl Filesystem for RedisFs {
     ) {
         match self.write_file(ino, offset, data) {
             Ok(bytes_written) => {
-                slog::debug!(self.logger, "成功写入文件";
-                    "函数" => "write",
-                    "inode" => ino,
-                    "偏移量" => offset,
-                    "写入字节数" => bytes_written
+                slog::debug!(self.logger, "Successfully wrote to file";
+                    "function" => "write",
+                    "ino" => ino,
+                    "offset" => offset,
+                    "bytes_written" => bytes_written
                 );
                 reply.written(bytes_written as u32);
             },
             Err(error_code) => {
-                slog::error!(self.logger, "写入文件失败";
-                    "函数" => "write",
-                    "inode" => ino,
-                    "偏移量" => offset,
-                    "错误代码" => error_code
+                slog::error!(self.logger, "Failed to write to file";
+                    "function" => "write",
+                    "ino" => ino,
+                    "offset" => offset,
+                    "error_code" => error_code
                 );
                 reply.error(error_code);
             }
@@ -214,20 +214,20 @@ impl Filesystem for RedisFs {
     ) {
         match self.read_file(ino, offset, size) {
             Ok(data) => {
-                slog::debug!(self.logger, "成功读取文件";
-                    "函数" => "read",
-                    "inode" => ino,
-                    "偏移量" => offset,
-                    "读取字节数" => data.len()
+                slog::debug!(self.logger, "Successfully read file";
+                    "function" => "read",
+                    "ino" => ino,
+                    "offset" => offset,
+                    "bytes_read" => data.len()
                 );
                 reply.data(&data);
             },
             Err(error_code) => {
-                slog::error!(self.logger, "读取文件失败";
-                    "函数" => "read",
-                    "inode" => ino,
-                    "偏移量" => offset,
-                    "错误代码" => error_code
+                slog::error!(self.logger, "Failed to read file";
+                    "function" => "read",
+                    "ino" => ino,
+                    "offset" => offset,
+                    "error_code" => error_code
                 );
                 reply.error(error_code);
             }
