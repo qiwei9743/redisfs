@@ -1,4 +1,4 @@
-use fuser::{Filesystem, Request, ReplyAttr, FileAttr, ReplyEntry, ReplyCreate, ReplyWrite, ReplyData, ReplyEmpty};
+use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyCreate, ReplyWrite, ReplyData, ReplyEmpty};
 use tokio::task;
 
 use crate::fs::redisfs::RedisFs;
@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::ffi::OsStr;
 use libc::ENOENT;
 
-use slog::{debug, warn, error, Logger, o, Drain};
+use slog::{debug, warn, error};
 
 impl Filesystem for RedisFs {
     fn setattr(

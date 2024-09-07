@@ -4,12 +4,7 @@ use clap::{Parser, Subcommand, Args};
 use fuser::MountOption;
 use std::path::PathBuf;
 use std::error::Error;
-use std::sync::Arc;
 use crate::fs::redisfs::{RedisFs, RedisFsck};
-use slog::{o, Drain, Logger};
-use slog_term;
-use slog_async;
-use slog_envlogger;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
