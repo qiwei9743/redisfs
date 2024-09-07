@@ -1,7 +1,5 @@
-use fuser::{Filesystem, Request, ReplyAttr, FileAttr, ReplyEntry, ReplyCreate, ReplyWrite, ReplyData};
-use tokio::runtime::Runtime;
+use fuser::{Filesystem, Request, ReplyAttr, FileAttr, ReplyEntry, ReplyCreate, ReplyWrite, ReplyData, ReplyEmpty};
 use tokio::task;
-use std::sync::Arc;
 
 use crate::fs::redisfs::RedisFs;
 use std::time::Duration;
@@ -280,6 +278,62 @@ impl Filesystem for RedisFs {
                         "function" => "read",
                         "ino" => ino,
                         "offset" => offset,
+                        "error_code" => error_code
+                    );
+                    reply.error(error_code);
+                }
+            }
+        });
+    }
+
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let fs = self.clone();
+        let logger = self.logger.clone();
+        let name = name.to_owned();
+        
+        task::spawn(async move {
+            match fs.remove_file(parent, &name).await {
+                Ok(()) => {
+                    slog::debug!(logger, "Successfully removed file";
+                        "function" => "unlink",
+                        "parent" => parent,
+                        "name" => ?name
+                    );
+                    reply.ok();
+                },
+                Err(error_code) => {
+                    slog::error!(logger, "Failed to remove file";
+                        "function" => "unlink",
+                        "parent" => parent,
+                        "name" => ?name,
+                        "error_code" => error_code
+                    );
+                    reply.error(error_code);
+                }
+            }
+        });
+    }
+
+    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let fs = self.clone();
+        let logger = self.logger.clone();
+        let name = name.to_owned();
+        
+        task::spawn(async move {
+            match fs.remove_directory(parent, &name).await {
+                Ok(()) => {
+                    slog::debug!(logger, "Successfully removed directory";
+                        "function" => "rmdir",
+                        "parent" => parent,
+                        "name" => ?name
+                    );
+                    reply.ok();
+                },
+                Err(error_code) => {
+                    slog::error!(logger, "Failed to remove directory";
+                        "function" => "rmdir",
+                        "parent" => parent,
+                        "name" => ?name,
                         "error_code" => error_code
                     );
                     reply.error(error_code);

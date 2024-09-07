@@ -15,6 +15,7 @@ use snafu::{ResultExt, Whatever, Snafu};
 use fuser::{FileAttr, FileType};
 use slog_envlogger;
 use std::sync::Arc;
+use libc::{EINVAL, ENOTEMPTY};
 
 pub struct RedisFs {
     redis_client: ConnectionManager,
@@ -372,7 +373,7 @@ impl RedisFs {
 
         if file_size > 0 {
             let existing_content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
-                slog::error!(self.logger, "读取文件内容失败"; "inode" => ino, "错误" => ?e, "函数" => "write_file");
+                slog::error!(self.logger, "Failed to read file content"; "inode" => ino, "error" => ?e, "function" => "write_file");
                 EIO
             })?;
             file_content[..file_size as usize].copy_from_slice(&existing_content);
@@ -381,14 +382,14 @@ impl RedisFs {
         file_content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
 
         conn.set(&file_key, &file_content).await.map_err(|e| {
-            slog::error!(self.logger, "写入文件内容失败"; "inode" => ino, "错误" => ?e, "函数" => "write_file");
+            slog::error!(self.logger, "Failed to write file content"; "inode" => ino, "error" => ?e, "function" => "write_file");
             EIO
         })?;
 
-        // 更新文件大小
+        // Update file size
         self.set_attr_opt(ino, None, None, None, Some(new_size), None).await?;
 
-        slog::debug!(self.logger, "成功写入文件"; "inode" => ino, "偏移量" => offset, "写入字节数" => data.len());
+        slog::debug!(self.logger, "Successfully wrote to file"; "inode" => ino, "offset" => offset, "bytes_written" => data.len(), "function" => "write_file");
         Ok(data.len() as u32)
     }
 
@@ -398,17 +399,17 @@ impl RedisFs {
         let file_key = format!("inode:{}:data", ino);
 
         let content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
-            slog::error!(self.logger, "读取文件内容失败"; "inode" => ino, "错误" => ?e, "函数" => "read_file");
+            slog::error!(self.logger, "Failed to read file content"; "inode" => ino, "error" => ?e, "function" => "read_file");
             EIO
         })?;
 
         let file_size = content.len() as u64;
-        slog::debug!(self.logger, "开始读取文件"; 
-            "函数" => "read_file",
+        slog::debug!(self.logger, "Starting to read file"; 
+            "function" => "read_file",
             "inode" => ino, 
-            "偏移量" => offset,
-            "请求大小" => size,
-            "文件大小" => file_size
+            "offset" => offset,
+            "requested_size" => size,
+            "file_size" => file_size
         );
 
         if offset as u64 >= file_size {
@@ -419,7 +420,98 @@ impl RedisFs {
         let end = std::cmp::min(start + size as usize, content.len());
         let data = content[start..end].to_vec();
 
-        slog::debug!(self.logger, "成功读取文件"; "inode" => ino, "偏移量" => offset, "读取字节数" => data.len());
+        slog::debug!(self.logger, "Successfully read file"; "inode" => ino, "offset" => offset, "bytes_read" => data.len(), "function" => "read_file");
         Ok(data)
+    }
+    pub async fn remove_file(&self, parent: u64, name: &OsStr) -> Result<(), i32> {
+        let mut conn = self.redis_client.clone();
+        let parent_key = format!("inode:{}:children", parent);
+        let name_str = name.to_str().ok_or(EINVAL)?;
+
+        // Get file's inode
+        let ino: u64 = conn.hget(&parent_key, name_str).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to get file inode"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e, "function" => "remove_file");
+            EIO
+        })?;
+
+        // Delete file data
+        let file_key = format!("inode:{}:data", ino);
+        conn.del(&file_key).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to delete file data"; "inode" => ino, "error" => ?e, "function" => "remove_file");
+            EIO
+        })?;
+
+        // Delete file attributes
+        let attr_key = format!("inode:{}:attr", ino);
+        conn.del(&attr_key).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to delete file attributes"; "inode" => ino, "error" => ?e, "function" => "remove_file");
+            EIO
+        })?;
+
+        // Remove file from parent directory
+        conn.hdel(&parent_key, name_str).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to remove file from parent directory"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e, "function" => "remove_file");
+            EIO
+        })?;
+
+        slog::debug!(self.logger, "Successfully deleted file"; "parent_inode" => parent, "file_name" => ?name, "inode" => ino, "function" => "remove_file");
+        Ok(())
+    }
+
+    pub async fn remove_directory(&self, parent: u64, name: &OsStr) -> Result<(), i32> {
+        let mut conn = self.redis_client.clone();
+        let parent_key = format!("inode:{}:children", parent);
+        let name_str = name.to_str().ok_or(libc::EINVAL)?;
+
+        // Get directory's inode
+        let ino: u64 = conn.hget(&parent_key, name_str).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to get directory inode"; "parent_inode" => parent, "dir_name" => ?name, "error" => ?e, "function" => "remove_directory");
+            EIO
+        })?;
+
+        // Check if directory is empty
+        let dir_key = format!("inode:{}:children", ino);
+        let children_count: u64 = conn.hlen(&dir_key).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to get directory child count"; "inode" => ino, "error" => ?e, "function" => "remove_directory");
+            EIO
+        })?;
+
+        if children_count > 2 {
+            slog::warn!(self.logger, "Attempted to delete non-empty directory"; "inode" => ino, "child_count" => children_count, "function" => "remove_directory");
+            return Err(ENOTEMPTY);
+        } else if children_count == 2 {
+            // If there are exactly 2 entries, check if they are "." and ".."
+            let children: std::collections::HashMap<String, String> = conn.hgetall(&dir_key).await.map_err(|e| {
+                slog::error!(self.logger, "Failed to get directory children"; "inode" => ino, "error" => ?e, "function" => "remove_directory");
+                EIO
+            })?;
+
+            if !children.keys().all(|k| k == "." || k == "..") {
+                slog::warn!(self.logger, "Attempted to delete non-empty directory"; "inode" => ino, "child_count" => children_count, "function" => "remove_directory");
+                return Err(ENOTEMPTY);
+            }
+        }
+
+        // Delete directory attributes
+        let attr_key = format!("inode:{}:attr", ino);
+        conn.del(&attr_key).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to delete directory attributes"; "inode" => ino, "error" => ?e, "function" => "remove_directory");
+            EIO
+        })?;
+
+        // Delete directory's children key
+        conn.del(&dir_key).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to delete directory children key"; "inode" => ino, "error" => ?e, "function" => "remove_directory");
+            EIO
+        })?;
+
+        // Remove directory from parent directory
+        conn.hdel(&parent_key, name_str).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to remove directory from parent directory"; "parent_inode" => parent, "dir_name" => ?name, "error" => ?e, "function" => "remove_directory");
+            EIO
+        })?;
+
+        slog::debug!(self.logger, "Successfully deleted directory"; "parent_inode" => parent, "dir_name" => ?name, "inode" => ino, "function" => "remove_directory");
+        Ok(())
     }
 }
