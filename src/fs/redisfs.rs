@@ -79,20 +79,45 @@ impl RedisFs {
         if !conn.exists(root_key).await? {
             debug!(self.logger, "Root inode does not exist, creating"; "function" => "ensure_root_inode");
             
+            let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs();
+            let now_str = now.to_string();
             let root_attr = vec![
+                ("ino", "1"),
                 ("size", "0"),
-                ("mode", "0755"),
+                ("blocks", "1"),
+                ("atime", &now_str),
+                ("mtime", &now_str),
+                ("ctime", &now_str),
+                ("crtime", &now_str),
+                ("kind", "4"),  // 4 represents Directory
+                ("mode", "0755"),  // Correct permissions for root directory
                 ("uid", "0"),
                 ("gid", "0"),
-                ("filetype", "3"),
+                ("nlink", "2"),  // Root directory starts with 2 links (. and ..)
             ];
             
             conn.hset_multiple(root_key, &root_attr).await?;
             conn.set("next_inode", 2).await?;
             
+            // Create . and .. entries for root directory
+            let children_key = "inode:1:children";
+            conn.hset(children_key, ".", 1).await?;
+            conn.hset(children_key, "..", 1).await?;
+            
             debug!(self.logger, "Root inode created, next_inode set to 2"; "function" => "ensure_root_inode");
         } else {
             debug!(self.logger, "Root inode already exists"; "function" => "ensure_root_inode");
+            // Verify and correct root inode if necessary
+            let attr: HashMap<String, String> = conn.hgetall(root_key).await?;
+            if attr.get("kind").map_or(true, |k| k != "4") || 
+               attr.get("mode").map_or(true, |m| m != "0755") ||
+               attr.get("nlink").map_or(true, |n| n != "2") {
+                // Correct the root inode attributes
+                conn.hset(root_key, "kind", "4").await?;
+                conn.hset(root_key, "mode", "0755").await?;
+                conn.hset(root_key, "nlink", "2").await?;
+                debug!(self.logger, "Corrected root inode attributes"; "function" => "ensure_root_inode");
+            }
         }
         
         Ok(())
@@ -258,14 +283,8 @@ impl RedisFs {
         }
 
         let mut conn = self.redis_client.clone();
-        let file_key = format!("inode:{}:data", ino);
+        let file_size = attr.size;
 
-        let content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to read file content"; "inode" => ino, "error" => ?e, "function" => "read_file");
-            EIO
-        })?;
-
-        let file_size = content.len() as u64;
         slog::debug!(self.logger, "Starting to read file"; 
             "function" => "read_file",
             "inode" => ino, 
@@ -278,9 +297,51 @@ impl RedisFs {
             return Ok(Vec::new());
         }
 
-        let start = offset as usize;
-        let end = std::cmp::min(start + size as usize, content.len());
-        let data = content[start..end].to_vec();
+        let start_block = (offset as u64) / self.block_size;
+        let end_block = ((offset as u64 + size as u64 - 1) / self.block_size).min((file_size - 1) / self.block_size);
+
+        let mut data = Vec::new();
+        for block in start_block..=end_block {
+            let block_key = format!("inode:{}:block:{}", ino, block);
+            let block_data: Vec<u8> = conn.get(&block_key).await.map_err(|e| {
+                slog::error!(self.logger, "Failed to read file block"; "inode" => ino, "block" => block, "error" => ?e, "function" => "read_file");
+                EIO
+            })?;
+
+            let block_offset = block * self.block_size;
+            let start = if block == start_block {
+                offset as u64 - block_offset
+            } else {
+                0
+            } as usize;
+
+            let end = if block == end_block {
+                ((offset as u64 + size as u64).min(file_size) - block_offset) as usize
+            } else {
+                block_data.len()
+            };
+
+            data.extend_from_slice(&block_data[start..end]);
+
+            if data.len() as u32 >= size {
+                break;
+            }
+        }
+
+        // Trim the data if we've read more than requested
+        if data.len() as u32 > size {
+            slog::debug!(self.logger, "Truncating read data"; 
+                "function" => "read_file",
+                "inode" => ino,
+                "original_size" => data.len(),
+                "truncated_size" => size
+            );
+            data.truncate(size as usize);
+        }
+
+        // TODO: Update access time (atime) for the file.
+        // This operation would improve accuracy but may impact read performance.
+        // Consider implementing this in the future, possibly with a configurable option.
 
         slog::debug!(self.logger, "Successfully read file"; "inode" => ino, "offset" => offset, "bytes_read" => data.len(), "function" => "read_file");
         Ok(data)
