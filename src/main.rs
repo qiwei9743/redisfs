@@ -4,7 +4,8 @@ use clap::{Parser, Subcommand, Args};
 use fuser::MountOption;
 use std::path::PathBuf;
 use std::error::Error;
-use crate::fs::redisfs::{RedisFs, RedisFsck};
+use crate::fs::redisfs::RedisFs;
+use crate::fs::redisfsck::RedisFsck;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]

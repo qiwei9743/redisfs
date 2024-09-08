@@ -210,7 +210,7 @@ impl Filesystem for RedisFs {
 
     fn write(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         _fh: u64,
         offset: i64,
@@ -224,8 +224,10 @@ impl Filesystem for RedisFs {
         let logger = self.logger.clone();
         let data = data.to_vec(); // Create a copy of the data
         
+        let req_uid = req.uid();
+        let req_gid = req.gid();
         task::spawn(async move {
-            match fs.write_file(ino, offset, &data).await {
+            match fs.write_file(ino, offset, &data, req_uid, req_gid).await {
                 Ok(bytes_written) => {
                     debug!(logger, "Successfully wrote to file";
                         "function" => "write",
@@ -250,7 +252,7 @@ impl Filesystem for RedisFs {
 
     fn read(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         _fh: u64,
         offset: i64,
@@ -262,8 +264,10 @@ impl Filesystem for RedisFs {
         let fs = self.clone();
         let logger = self.logger.clone();
         
+        let req_uid = req.uid();
+        let req_gid = req.gid();
         task::spawn(async move {
-            match fs.read_file(ino, offset, size).await {
+            match fs.read_file(ino, offset, size, req_uid, req_gid).await {
                 Ok(data) => {
                     debug!(logger, "Successfully read file";
                         "function" => "read",
@@ -286,13 +290,15 @@ impl Filesystem for RedisFs {
         });
     }
 
-    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let fs = self.clone();
         let logger = self.logger.clone();
         let name = name.to_owned();
         
+        let req_uid = req.uid();
+        let req_gid = req.gid();
         task::spawn(async move {
-            match fs.remove_file(parent, &name).await {
+            match fs.remove_file(parent, &name, req_uid, req_gid).await {
                 Ok(()) => {
                     slog::debug!(logger, "Successfully removed file";
                         "function" => "unlink",
@@ -314,13 +320,15 @@ impl Filesystem for RedisFs {
         });
     }
 
-    fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    fn rmdir(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let fs = self.clone();
         let logger = self.logger.clone();
         let name = name.to_owned();
         
+        let req_uid = req.uid();
+        let req_gid = req.gid();
         task::spawn(async move {
-            match fs.remove_directory(parent, &name).await {
+            match fs.remove_directory(parent, &name, req_uid, req_gid).await {
                 Ok(()) => {
                     slog::debug!(logger, "Successfully removed directory";
                         "function" => "rmdir",

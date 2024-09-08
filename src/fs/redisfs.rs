@@ -12,7 +12,7 @@ use fuser::FileAttr;
 use slog_envlogger;
 use std::sync::Arc;
 use libc::{EINVAL, ENOTEMPTY};
-use std::collections::{HashSet, HashMap};
+use std::collections::HashMap;
 
 pub struct RedisFs {
     redis_client: ConnectionManager,
@@ -36,23 +36,23 @@ impl RedisFs {
             .append(true)
             .open("log.txt")?;
 
-        // 创建一个终端风格的 Drain
+        // Create a terminal-style Drain
         let decorator_term = slog_term::TermDecorator::new().build();
         let drain_term = slog_term::FullFormat::new(decorator_term).build().fuse();
         let drain_term = slog_async::Async::new(drain_term).build().fuse();
 
-        // 创建一个文件风格的 Drain
+        // Create a file-style Drain
         let decorator_file = slog_term::PlainDecorator::new(file);
         let drain_file = slog_term::FullFormat::new(decorator_file).build().fuse();
         let drain_file = slog_async::Async::new(drain_file).build().fuse();
 
-        // 合并两个 Drain
+        // Merge the two Drains
         let drain = slog::Duplicate::new(drain_term, drain_file).fuse();
         
-        // 使用 slog_envlogger 创建可配置的日志级别
+        // Create a configurable log level using slog_envlogger
         let drain = slog_envlogger::new(drain).fuse();
         
-        // 创建根日志记录器
+        // Create the root logger
         let logger = Arc::new(slog::Logger::root(drain, o!("module" => "redisfs")));
 
         let client = redis::Client::open(redis_url)?;
@@ -72,7 +72,7 @@ impl RedisFs {
         let root_key = "inode:1";
         
         if !conn.exists(root_key).await? {
-            debug!(self.logger, "根inode不存在，正在创建");
+            debug!(self.logger, "Root inode does not exist, creating"; "function" => "ensure_root_inode");
             
             let root_attr = vec![
                 ("size", "0"),
@@ -85,9 +85,9 @@ impl RedisFs {
             conn.hset_multiple(root_key, &root_attr).await?;
             conn.set("next_inode", 2).await?;
             
-            debug!(self.logger, "根inode创建成功，next_inode设置为2");
+            debug!(self.logger, "Root inode created, next_inode set to 2"; "function" => "ensure_root_inode");
         } else {
-            debug!(self.logger, "根inode已存在");
+            debug!(self.logger, "Root inode already exists"; "function" => "ensure_root_inode");
         }
         
         Ok(())
@@ -115,7 +115,7 @@ impl RedisFs {
             });
 
         pipe.query_async(&mut conn).await.map_err(|e| {
-            slog::error!(self.logger, "无法设置inode属性"; "inode" => ino, "错误" => ?e);
+            slog::error!(self.logger, "Failed to set inode attributes"; "inode" => ino, "error" => ?e, "function" => "set_attr");
             EIO
         })?;
 
@@ -148,11 +148,11 @@ impl RedisFs {
         pipe.hset(&attr_key, "ctime", now);
 
         pipe.query_async(&mut conn).await.map_err(|e| {
-            slog::error!(self.logger, "无法设置inode属性"; "inode" => ino, "错误" => ?e, "函数" => "set_attr");
+            slog::error!(self.logger, "Failed to set inode attributes"; "inode" => ino, "error" => ?e, "function" => "set_attr_opt");
             EIO
         })?;
 
-        // 获取更新后的属性
+        // Get the updated attributes
         self.get_attr(ino).await
     }
 
@@ -161,12 +161,12 @@ impl RedisFs {
 
         let attr_key = format!("inode:{}", ino);
         let attr: std::collections::HashMap<String, String> = conn.hgetall(&attr_key).await.map_err(|e| {
-            slog::error!(self.logger, "无法获取inode属性"; "inode" => ino, "错误" => ?e);
+            slog::error!(self.logger, "Failed to get inode attributes"; "inode" => ino, "error" => ?e, "function" => "get_attr");
             EIO
         })?;
 
         if attr.is_empty() {
-            slog::error!(self.logger, "inode不存在"; "inode" => ino);
+            slog::error!(self.logger, "Inode does not exist"; "inode" => ino, "function" => "get_attr");
             return Err(ENOENT);
         }
 
@@ -192,7 +192,7 @@ impl RedisFs {
             blksize: 4096,
         };
 
-        slog::debug!(self.logger, "成功获取inode属性"; "inode" => ino, "attr" => ?attr);
+        slog::debug!(self.logger, "Successfully got inode attributes"; "inode" => ino, "attr" => ?attr, "function" => "get_attr");
         Ok(attr)
     }
 
@@ -207,7 +207,7 @@ impl RedisFs {
                 match self.get_attr(ino).await {
                     Ok(attr) => Ok(attr),
                     Err(e) => {
-                        error!(self.logger, "Failed to get attributes"; "inode" => ino, "error" => ?e);
+                        error!(self.logger, "Failed to get attributes"; "inode" => ino, "error" => ?e, "function" => "lookup");
                         Err(EIO)
                     }
                 }
@@ -216,12 +216,111 @@ impl RedisFs {
         }
     }
 
+    // Helper function for permission check
+    fn check_permission(&self, attr: &FileAttr, uid: u32, gid: u32, mask: u32) -> bool {
+        if uid == 0 {  // root user always has permission
+            return true;
+        }
+
+        let mode = if attr.uid == uid {
+            (attr.perm >> 6) & 7
+        } else if attr.gid == gid {
+            (attr.perm >> 3) & 7
+        } else {
+            attr.perm & 7
+        };
+
+        (mode as u32 & mask) == mask
+    }
+
+    pub async fn read_file(&self, ino: u64, offset: i64, size: u32, uid: u32, gid: u32) -> Result<Vec<u8>, i32> {
+        let attr = self.get_attr(ino).await?;
+        
+        if !self.check_permission(&attr, uid, gid, 4) {  // 4 is for read permission
+            slog::warn!(self.logger, "Insufficient permissions to read file"; "inode" => ino, "uid" => uid, "gid" => gid, "function" => "read_file");
+            return Err(libc::EACCES);
+        }
+
+        let mut conn = self.redis_client.clone();
+        let file_key = format!("inode:{}:data", ino);
+
+        let content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to read file content"; "inode" => ino, "error" => ?e, "function" => "read_file");
+            EIO
+        })?;
+
+        let file_size = content.len() as u64;
+        slog::debug!(self.logger, "Starting to read file"; 
+            "function" => "read_file",
+            "inode" => ino, 
+            "offset" => offset,
+            "requested_size" => size,
+            "file_size" => file_size
+        );
+
+        if offset as u64 >= file_size {
+            return Ok(Vec::new());
+        }
+
+        let start = offset as usize;
+        let end = std::cmp::min(start + size as usize, content.len());
+        let data = content[start..end].to_vec();
+
+        slog::debug!(self.logger, "Successfully read file"; "inode" => ino, "offset" => offset, "bytes_read" => data.len(), "function" => "read_file");
+        Ok(data)
+    }
+
+    pub async fn write_file(&self, ino: u64, offset: i64, data: &[u8], uid: u32, gid: u32) -> Result<u32, i32> {
+        let attr = self.get_attr(ino).await?;
+        
+        if !self.check_permission(&attr, uid, gid, 2) {  // 2 is for write permission
+            slog::warn!(self.logger, "Insufficient permissions to write file"; "inode" => ino, "uid" => uid, "gid" => gid, "function" => "write_file");
+            return Err(libc::EACCES);
+        }
+
+        let mut conn = self.redis_client.clone();
+
+        let file_key = format!("inode:{}:data", ino);
+        let file_size: u64 = conn.get(&file_key).await.unwrap_or(0);
+
+        let new_size = std::cmp::max(file_size, (offset as u64) + (data.len() as u64));
+        let mut file_content = vec![0u8; new_size as usize];
+
+        if file_size > 0 {
+            let existing_content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
+                slog::error!(self.logger, "Failed to read file content"; "inode" => ino, "error" => ?e, "function" => "write_file");
+                EIO
+            })?;
+            file_content[..file_size as usize].copy_from_slice(&existing_content);
+        }
+
+        file_content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+
+        conn.set(&file_key, &file_content).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to write file content"; "inode" => ino, "error" => ?e, "function" => "write_file");
+            EIO
+        })?;
+
+        // Update file size
+        self.set_attr_opt(ino, None, None, None, Some(new_size), None).await?;
+
+        slog::debug!(self.logger, "Successfully wrote to file"; "inode" => ino, "offset" => offset, "bytes_written" => data.len(), "function" => "write_file");
+        Ok(data.len() as u32)
+    }
+
     pub async fn create_file(&self, parent: u64, name: &OsStr, mode: u32, umask: u32, flags: i32, uid: u32, gid: u32) -> Result<(u64, FileAttr), i32> {
+        let parent_attr = self.get_attr(parent).await?;
+        
+        if !self.check_permission(&parent_attr, uid, gid, 2) {  // 2 is for write permission in parent directory
+            slog::warn!(self.logger, "Insufficient permissions to create file"; "parent_inode" => parent, "uid" => uid, "gid" => gid, "function" => "create_file");
+            return Err(libc::EACCES);
+        }
+
         let mut conn = self.redis_client.clone();
 
         // Generate new inode number
         let new_ino: u64 = conn.incr("next_inode", 1).await.map_err(|e| {
-            error!(self.logger, "Failed to generate new inode number"; "error" => ?e);
+            error!(self.logger, "Failed to generate new inode number"; "error" => ?e, "function" => "create_file");
             EIO
         })?;
 
@@ -261,22 +360,29 @@ impl RedisFs {
             .hset(&attr_key, "crtime", now.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
 
         pipe.query_async(&mut conn).await.map_err(|e| {
-            error!(self.logger, "Failed to store new file attributes"; "inode" => new_ino, "error" => ?e);
+            error!(self.logger, "Failed to store new file attributes"; "inode" => new_ino, "error" => ?e, "function" => "create_file");
             EIO
         })?;
 
         // Add the new file to the parent directory
         let parent_key = format!("inode:{}:children", parent);
         conn.hset(&parent_key, name.to_str().unwrap(), new_ino).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to add new file to parent directory"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e);
+            slog::error!(self.logger, "Failed to add new file to parent directory"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e, "function" => "create_file");
             EIO
         })?;
 
-        slog::info!(self.logger, "Successfully created new file"; "parent_inode" => parent, "file_name" => ?name, "new_inode" => new_ino);
+        slog::info!(self.logger, "Successfully created new file"; "parent_inode" => parent, "file_name" => ?name, "new_inode" => new_ino, "function" => "create_file");
         Ok((new_ino, attr))
     }
 
     pub async fn create_directory(&self, parent: u64, name: &OsStr, mode: u32, umask: u32, uid: u32, gid: u32) -> Result<(u64, FileAttr), i32> {
+        let parent_attr = self.get_attr(parent).await?;
+        
+        if !self.check_permission(&parent_attr, uid, gid, 2) {  // 2 is for write permission in parent directory
+            slog::warn!(self.logger, "Insufficient permissions to create directory"; "parent_inode" => parent, "uid" => uid, "gid" => gid, "function" => "create_directory");
+            return Err(libc::EACCES);
+        }
+
         let mut conn = self.redis_client.clone();
 
         // Generate new inode number
@@ -355,72 +461,18 @@ impl RedisFs {
             }
         }
 
-        slog::debug!(self.logger, "Successfully read directory contents"; "parent_inode" => parent, "entry_count" => entries.len(), "offset" => offset);
+        slog::debug!(self.logger, "Successfully read directory contents"; "parent_inode" => parent, "entry_count" => entries.len(), "offset" => offset, "function" => "read_dir");
         Ok(entries)
     }
 
-    pub async fn write_file(&self, ino: u64, offset: i64, data: &[u8]) -> Result<u32, i32> {
-        let mut conn = self.redis_client.clone();
-
-        let file_key = format!("inode:{}:data", ino);
-        let file_size: u64 = conn.get(&file_key).await.unwrap_or(0);
-
-        let new_size = std::cmp::max(file_size, (offset as u64) + (data.len() as u64));
-        let mut file_content = vec![0u8; new_size as usize];
-
-        if file_size > 0 {
-            let existing_content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
-                slog::error!(self.logger, "Failed to read file content"; "inode" => ino, "error" => ?e, "function" => "write_file");
-                EIO
-            })?;
-            file_content[..file_size as usize].copy_from_slice(&existing_content);
+    pub async fn remove_file(&self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> Result<(), i32> {
+        let parent_attr = self.get_attr(parent).await?;
+        
+        if !self.check_permission(&parent_attr, uid, gid, 2) {  // 2 is for write permission in parent directory
+            slog::warn!(self.logger, "Insufficient permissions to remove file"; "parent_inode" => parent, "uid" => uid, "gid" => gid, "function" => "remove_file");
+            return Err(libc::EACCES);
         }
 
-        file_content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
-
-        conn.set(&file_key, &file_content).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to write file content"; "inode" => ino, "error" => ?e, "function" => "write_file");
-            EIO
-        })?;
-
-        // Update file size
-        self.set_attr_opt(ino, None, None, None, Some(new_size), None).await?;
-
-        slog::debug!(self.logger, "Successfully wrote to file"; "inode" => ino, "offset" => offset, "bytes_written" => data.len(), "function" => "write_file");
-        Ok(data.len() as u32)
-    }
-
-    pub async fn read_file(&self, ino: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
-        let mut conn = self.redis_client.clone();
-
-        let file_key = format!("inode:{}:data", ino);
-
-        let content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to read file content"; "inode" => ino, "error" => ?e, "function" => "read_file");
-            EIO
-        })?;
-
-        let file_size = content.len() as u64;
-        slog::debug!(self.logger, "Starting to read file"; 
-            "function" => "read_file",
-            "inode" => ino, 
-            "offset" => offset,
-            "requested_size" => size,
-            "file_size" => file_size
-        );
-
-        if offset as u64 >= file_size {
-            return Ok(Vec::new());
-        }
-
-        let start = offset as usize;
-        let end = std::cmp::min(start + size as usize, content.len());
-        let data = content[start..end].to_vec();
-
-        slog::debug!(self.logger, "Successfully read file"; "inode" => ino, "offset" => offset, "bytes_read" => data.len(), "function" => "read_file");
-        Ok(data)
-    }
-    pub async fn remove_file(&self, parent: u64, name: &OsStr) -> Result<(), i32> {
         let mut conn = self.redis_client.clone();
         let parent_key = format!("inode:{}:children", parent);
         let name_str = name.to_str().ok_or(EINVAL)?;
@@ -455,7 +507,14 @@ impl RedisFs {
         Ok(())
     }
 
-    pub async fn remove_directory(&self, parent: u64, name: &OsStr) -> Result<(), i32> {
+    pub async fn remove_directory(&self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> Result<(), i32> {
+        let parent_attr = self.get_attr(parent).await?;
+        
+        if !self.check_permission(&parent_attr, uid, gid, 2) {  // 2 is for write permission in parent directory
+            slog::warn!(self.logger, "Insufficient permissions to remove directory"; "parent_inode" => parent, "uid" => uid, "gid" => gid, "function" => "remove_directory");
+            return Err(libc::EACCES);
+        }
+
         let mut conn = self.redis_client.clone();
         let parent_key = format!("inode:{}:children", parent);
         let name_str = name.to_str().ok_or(libc::EINVAL)?;
@@ -513,280 +572,3 @@ impl RedisFs {
     }
 }
 
-
-pub struct RedisFsck {
-    redis_client: ConnectionManager,
-    logger: Arc<Logger>,
-}
-
-impl RedisFsck {
-    pub async fn new(redis_url: &str) -> Result<Self, Box<dyn Error>> {
-        // 创建日志记录器
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(true)
-            .open("fsck_log.txt")?;
-
-        // 创建一个终端风格的 Drain
-        let decorator_term = slog_term::TermDecorator::new().build();
-        let drain_term = slog_term::FullFormat::new(decorator_term).build().fuse();
-        let drain_term = slog_async::Async::new(drain_term).build().fuse();
-
-        // 创建一个文件风格的 Drain
-        let decorator_file = slog_term::PlainDecorator::new(file);
-        let drain_file = slog_term::FullFormat::new(decorator_file).build().fuse();
-        let drain_file = slog_async::Async::new(drain_file).build().fuse();
-
-        // 合并两个 Drain
-        let drain = slog::Duplicate::new(drain_term, drain_file).fuse();
-        
-        // 使用 slog_envlogger 创建可配置的日志级别
-        let drain = slog_envlogger::new(drain).fuse();
-        
-        // 创建根日志记录器
-        let logger = Arc::new(Logger::root(drain, o!("module" => "fsck")));
-
-        let client = redis::Client::open(redis_url)?;
-        let connection_manager = ConnectionManager::new(client).await?;
-        
-        Ok(RedisFsck {
-            redis_client: connection_manager,
-            logger,
-        })
-    }
-
-    pub async fn check_and_repair(&self) -> Result<(), Box<dyn Error>> {
-        slog::info!(self.logger, "Starting file system check and repair");
-        
-        self.check_inodes().await?;
-        self.check_directory_structure().await?;
-        self.check_file_data().await?;
-        self.repair_inconsistencies().await?;
-        
-        slog::info!(self.logger, "File system check and repair completed");
-        Ok(())
-    }
-
-    async fn check_inodes(&self) -> Result<(), Box<dyn Error>> {
-        slog::info!(self.logger, "Checking inodes");
-        let mut conn = self.redis_client.clone();
-
-        let keys: Vec<String> = conn.keys("inode:*").await?;
-        slog::info!(self.logger, "Retrieved {} inode keys from Redis", keys.len());
-        
-        for key in keys {
-            let inode: u64 = key.split(':').nth(1).unwrap().parse()?;
-            let attrs: HashMap<String, String> = conn.hgetall(&key).await?;
-            slog::info!(self.logger, "Checking inode"; "inode" => inode, "attributes" => ?attrs);
-
-            let required_attrs = vec!["size", "mode", "uid", "gid", "filetype"];
-            for attr in required_attrs {
-                if !attrs.contains_key(attr) {
-                    slog::warn!(self.logger, "Inode is missing required attribute"; "inode" => inode, "missing_attr" => attr);
-                    // TODO: Implement attribute repair
-                    slog::warn!(self.logger, "Attribute repair not implemented yet"; "inode" => inode, "attribute" => attr);
-                }
-            }
-
-            if let Some(filetype) = attrs.get("filetype") {
-                let filetype: u32 = filetype.parse()?;
-                if filetype != 3 && filetype != 4 {
-                    slog::warn!(self.logger, "Inode has invalid file type"; "inode" => inode, "filetype" => filetype);
-                    // TODO: Implement file type repair
-                    slog::warn!(self.logger, "File type repair not implemented yet"; "inode" => inode);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn check_directory_structure(&self) -> Result<(), Box<dyn Error>> {
-        slog::info!(self.logger, "Checking directory structure");
-        let mut conn = self.redis_client.clone();
-
-        let dir_keys: Vec<String> = conn.keys("inode:*:children").await?;
-        slog::info!(self.logger, "Retrieved {} directory keys from Redis", dir_keys.len());
-        
-        for dir_key in dir_keys {
-            let inode: u64 = dir_key.split(':').nth(1).unwrap().parse()?;
-            let children: HashMap<String, String> = conn.hgetall(&dir_key).await?;
-            slog::info!(self.logger, "Checking directory structure"; "inode" => inode, "child_count" => children.len());
-
-            if !children.contains_key(".") || !children.contains_key("..") {
-                slog::warn!(self.logger, "Directory is missing '.' or '..' entries"; "inode" => inode);
-                // TODO: Implement repair for missing . and .. entries
-                slog::warn!(self.logger, "Repair for missing '.' and '..' entries not implemented yet"; "inode" => inode);
-            }
-
-            for (name, child_inode) in children {
-                if name != "." && name != ".." {
-                    let child_key = format!("inode:{}", &child_inode);
-                    let exists: bool = conn.exists(&child_key).await?;
-                    slog::info!(self.logger, "Checking child inode"; "parent_inode" => inode, "child_name" => &name, "child_inode" => &child_inode, "exists" => exists);
-                    if !exists {
-                        slog::warn!(self.logger, "Directory contains non-existent child"; "parent_inode" => inode, "child_name" => &name, "child_inode" => child_inode);
-                        // TODO: Implement removal of non-existent child
-                        slog::warn!(self.logger, "Removal of non-existent child not implemented yet"; "parent_inode" => inode, "child_name" => name);
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn check_file_data(&self) -> Result<(), Box<dyn Error>> {
-        slog::info!(self.logger, "Checking file data");
-        let mut conn = self.redis_client.clone();
-
-        let file_keys: Vec<String> = conn.keys("inode:*").await?;
-        slog::info!(self.logger, "Retrieved {} inode keys from Redis", file_keys.len());
-        
-        for file_key in file_keys {
-            let inode: u64 = file_key.split(':').nth(1).unwrap().parse()?;
-            let attrs: HashMap<String, String> = conn.hgetall(&file_key).await?;
-            slog::info!(self.logger, "Checking file data"; "inode" => inode, "attributes" => ?attrs);
-
-            if attrs.get("filetype").unwrap() == "4" {  // Regular file
-                let data_key = format!("inode:{}:data", inode);
-                let size: u64 = attrs.get("size").unwrap().parse()?;
-                let actual_size: u64 = conn.strlen(&data_key).await?;
-                slog::info!(self.logger, "Comparing file sizes"; "inode" => inode, "expected_size" => size, "actual_size" => actual_size);
-
-                if size != actual_size {
-                    slog::warn!(self.logger, "File size mismatch"; "inode" => inode, "expected_size" => size, "actual_size" => actual_size);
-                    // TODO: Implement file size mismatch repair
-                    slog::warn!(self.logger, "File size mismatch repair not implemented yet"; "inode" => inode);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn repair_inconsistencies(&self) -> Result<(), Box<dyn Error>> {
-        slog::info!(self.logger, "Repairing inconsistencies");
-        let mut conn = self.redis_client.clone();
-
-        let all_inodes: HashSet<u64> = conn.keys::<&str, Vec<String>>("inode:*")
-            .await?
-            .into_iter()
-            .filter_map(|key| key.split(':').nth(1)?.parse().ok())
-            .collect();
-        slog::info!(self.logger, "Retrieved {} total inodes", all_inodes.len());
-
-        let mut referenced_inodes = HashSet::new();
-        let dir_keys: Vec<String> = conn.keys("inode:*:children").await?;
-        slog::info!(self.logger, "Retrieved {} directory keys", dir_keys.len());
-        
-        for dir_key in dir_keys {
-            let children: HashMap<String, String> = conn.hgetall(&dir_key).await?;
-            for child_inode in children.values() {
-                referenced_inodes.insert(child_inode.parse::<u64>()?);
-            }
-        }
-        slog::info!(self.logger, "Found {} referenced inodes", referenced_inodes.len());
-
-        let orphaned_inodes: Vec<u64> = all_inodes.difference(&referenced_inodes).cloned().collect();
-        slog::info!(self.logger, "Found {} orphaned inodes", orphaned_inodes.len());
-
-        for orphaned_inode in orphaned_inodes {
-            slog::warn!(self.logger, "Found orphaned inode"; "inode" => orphaned_inode);
-            // TODO: Implement orphaned inode handling
-            slog::warn!(self.logger, "Orphaned inode handling not implemented yet"; "inode" => orphaned_inode);
-        }
-
-        Ok(())
-    }
-
-    pub async fn check_consistency_from_root(&self) -> Result<(), Box<dyn Error>> {
-        slog::info!(self.logger, "Starting consistency check from root inode");
-        let mut conn = self.redis_client.clone();
-
-        let root_inode = 1; // Assume root inode is always 1
-        let mut visited_inodes = HashSet::new();
-        let mut stack = vec![root_inode];
-
-        while let Some(inode) = stack.pop() {
-            if visited_inodes.contains(&inode) {
-                continue;
-            }
-            visited_inodes.insert(inode);
-            slog::info!(self.logger, "Checking inode"; "inode" => %inode);
-
-            let inode_key = format!("inode:{}", inode);
-            let attrs: HashMap<String, String> = conn.hgetall(&inode_key).await?;
-
-            if attrs.is_empty() {
-                slog::warn!(self.logger, "Inode does not exist"; "inode" => %inode);
-                continue;
-            }
-
-            // Check inode attributes
-            let required_attrs = vec!["size", "mode", "uid", "gid", "filetype"];
-            for attr in required_attrs {
-                if !attrs.contains_key(attr) {
-                    slog::warn!(self.logger, "Inode is missing required attribute"; "inode" => %inode, "missing_attr" => %attr);
-                }
-            }
-
-            // Check file type
-            let filetype = attrs.get("filetype").and_then(|ft| ft.parse::<u32>().ok()).unwrap_or(0);
-            if filetype != 3 && filetype != 4 {
-                slog::warn!(self.logger, "Inode has invalid file type"; "inode" => %inode, "filetype" => %filetype);
-            }
-
-            // If it's a directory, check its children
-            if filetype == 3 {
-                let children_key = format!("inode:{}:children", inode);
-                let children: HashMap<String, String> = conn.hgetall(&children_key).await?;
-
-                if !children.contains_key(".") || !children.contains_key("..") {
-                    slog::warn!(self.logger, "Directory is missing '.' or '..' entries"; "inode" => %inode);
-                }
-
-                for (name, child_inode) in children {
-                    if name != "." && name != ".." {
-                        if let Ok(child_inode) = child_inode.parse::<u64>() {
-                            stack.push(child_inode);
-                        }
-                    }
-                }
-            } else if filetype == 4 {
-                // If it's a regular file, check its data
-                let data_key = format!("inode:{}:data", inode);
-                let size: u64 = attrs.get("size").and_then(|s| s.parse().ok()).unwrap_or(0);
-                let actual_size: u64 = conn.strlen(&data_key).await?;
-
-                if size != actual_size {
-                    slog::warn!(self.logger, "File size mismatch"; "inode" => inode, "expected_size" => size, "actual_size" => actual_size);
-                }
-            }
-        }
-
-        // Check for orphaned inodes
-        let mut all_inodes = HashSet::new();
-        let mut scan = conn.scan_match::<&str, String>("inode:*").await?;
-        while let Some(key) = scan.next_item().await {
-            if let Some(inode_str) = key.split(':').nth(1) {
-                if let Ok(inode) = inode_str.parse() {
-                    all_inodes.insert(inode);
-                }
-            }
-        }
-
-        let orphaned_inodes: Vec<u64> = all_inodes.difference(&visited_inodes).cloned().collect();
-        slog::info!(self.logger, "Found {} orphaned inodes", orphaned_inodes.len());
-
-        for orphaned_inode in orphaned_inodes {
-            slog::warn!(self.logger, "Found orphaned inode"; "inode" => orphaned_inode);
-            // TODO: Implement orphaned inode handling
-            slog::warn!(self.logger, "Orphaned inode handling not implemented yet"; "inode" => orphaned_inode);
-        }
-
-        slog::info!(self.logger, "Consistency check from root completed");
-        Ok(())
-    }
-}
