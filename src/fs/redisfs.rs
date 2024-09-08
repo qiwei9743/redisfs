@@ -184,7 +184,7 @@ impl RedisFs {
                 _ => fuser::FileType::RegularFile,
             },
             perm: attr.get("mode").and_then(|m| m.parse().ok()).unwrap_or(0o644),
-            nlink: 1,
+            nlink: attr.get("nlink").and_then(|n| n.parse().ok()).unwrap_or(1),
             uid: attr.get("uid").and_then(|u| u.parse().ok()).unwrap_or(0),
             gid: attr.get("gid").and_then(|g| g.parse().ok()).unwrap_or(0),
             rdev: 0,
@@ -465,46 +465,65 @@ impl RedisFs {
         Ok(entries)
     }
 
-    pub async fn remove_file(&self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> Result<(), i32> {
-        let parent_attr = self.get_attr(parent).await?;
-        
-        if !self.check_permission(&parent_attr, uid, gid, 2) {  // 2 is for write permission in parent directory
-            slog::warn!(self.logger, "Insufficient permissions to remove file"; "parent_inode" => parent, "uid" => uid, "gid" => gid, "function" => "remove_file");
-            return Err(libc::EACCES);
-        }
-
+    pub async fn unlink(&self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> Result<(), i32> {
         let mut conn = self.redis_client.clone();
         let parent_key = format!("inode:{}:children", parent);
         let name_str = name.to_str().ok_or(EINVAL)?;
 
+        // Check permissions on the parent directory
+        let parent_attr = self.get_attr(parent).await?;
+        if !self.check_permission(&parent_attr, uid, gid, 2) {  // 2 is for write permission
+            slog::warn!(self.logger, "Insufficient permissions to unlink file"; "parent_inode" => parent, "uid" => uid, "gid" => gid, "function" => "unlink");
+            return Err(libc::EACCES);
+        }
+
         // Get file's inode
         let ino: u64 = conn.hget(&parent_key, name_str).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to get file inode"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e, "function" => "remove_file");
+            slog::error!(self.logger, "Failed to get file inode"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e, "function" => "unlink");
             EIO
         })?;
 
-        // Delete file data
-        let file_key = format!("inode:{}:data", ino);
-        conn.del(&file_key).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to delete file data"; "inode" => ino, "error" => ?e, "function" => "remove_file");
-            EIO
-        })?;
+        // Get the file's attributes
+        let mut attr = self.get_attr(ino).await?;
 
-        // Delete file attributes
-        let attr_key = format!("inode:{}:attr", ino);
-        conn.del(&attr_key).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to delete file attributes"; "inode" => ino, "error" => ?e, "function" => "remove_file");
-            EIO
-        })?;
+        // Decrease the nlink count
+        attr.nlink -= 1;
+
+        if attr.nlink == 0 {
+            // If nlink is 0, delete the file data and attributes
+            let file_key = format!("inode:{}:data", ino);
+            conn.del(&file_key).await.map_err(|e| {
+                slog::error!(self.logger, "Failed to delete file data"; "inode" => ino, "error" => ?e, "function" => "unlink");
+                EIO
+            })?;
+
+            let attr_key = format!("inode:{}", ino);
+            conn.del(&attr_key).await.map_err(|e| {
+                slog::error!(self.logger, "Failed to delete file attributes"; "inode" => ino, "error" => ?e, "function" => "unlink");
+                EIO
+            })?;
+        } else {
+            // Update the nlink count in Redis
+            let attr_key = format!("inode:{}", ino);
+            conn.hset(&attr_key, "nlink", attr.nlink).await.map_err(|e| {
+                slog::error!(self.logger, "Failed to update nlink count"; "inode" => ino, "error" => ?e, "function" => "unlink");
+                EIO
+            })?;
+        }
 
         // Remove file from parent directory
         conn.hdel(&parent_key, name_str).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to remove file from parent directory"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e, "function" => "remove_file");
+            slog::error!(self.logger, "Failed to remove file from parent directory"; "parent_inode" => parent, "file_name" => ?name, "error" => ?e, "function" => "unlink");
             EIO
         })?;
 
-        slog::debug!(self.logger, "Successfully deleted file"; "parent_inode" => parent, "file_name" => ?name, "inode" => ino, "function" => "remove_file");
+        slog::debug!(self.logger, "Successfully unlinked file"; "parent_inode" => parent, "file_name" => ?name, "inode" => ino, "nlink" => attr.nlink, "function" => "unlink");
         Ok(())
+    }
+
+    pub async fn remove_file(&self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> Result<(), i32> {
+        // Directly call unlink function
+        self.unlink(parent, name, uid, gid).await
     }
 
     pub async fn remove_directory(&self, parent: u64, name: &OsStr, uid: u32, gid: u32) -> Result<(), i32> {
@@ -569,6 +588,41 @@ impl RedisFs {
 
         slog::debug!(self.logger, "Successfully deleted directory"; "parent_inode" => parent, "dir_name" => ?name, "inode" => ino, "function" => "remove_directory");
         Ok(())
+    }
+
+    pub async fn link(&self, ino: u64, new_parent: u64, new_name: &OsStr, uid: u32, gid: u32) -> Result<FileAttr, i32> {
+        let mut conn = self.redis_client.clone();
+        let new_parent_key = format!("inode:{}:children", new_parent);
+        let new_name_str = new_name.to_str().ok_or(EINVAL)?;
+
+        // Check permissions on the new parent directory
+        let new_parent_attr = self.get_attr(new_parent).await?;
+        if !self.check_permission(&new_parent_attr, uid, gid, 2) {  // 2 is for write permission
+            slog::warn!(self.logger, "Insufficient permissions to create link in new parent directory"; "new_parent_inode" => new_parent, "uid" => uid, "gid" => gid, "function" => "link");
+            return Err(libc::EACCES);
+        }
+
+        // Get the existing file's attributes
+        let mut attr = self.get_attr(ino).await?;
+
+        // Increase the nlink count
+        attr.nlink += 1;
+
+        // Update the file's attributes in Redis
+        let attr_key = format!("inode:{}", ino);
+        conn.hset(&attr_key, "nlink", attr.nlink).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to update nlink count"; "inode" => ino, "error" => ?e, "function" => "link");
+            EIO
+        })?;
+
+        // Add the new link to the parent directory
+        conn.hset(&new_parent_key, new_name_str, ino).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to add new link to parent directory"; "parent_inode" => new_parent, "new_name" => ?new_name, "error" => ?e, "function" => "link");
+            EIO
+        })?;
+
+        slog::debug!(self.logger, "Successfully created new link"; "inode" => ino, "new_parent" => new_parent, "new_name" => ?new_name, "function" => "link");
+        Ok(attr)
     }
 }
 

@@ -289,6 +289,37 @@ impl Filesystem for RedisFs {
             }
         });
     }
+    fn link(&mut self, req: &Request<'_>, ino: u64, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        let fs = self.clone();
+        let logger = self.logger.clone();
+        let name = name.to_owned();
+        
+        let req_uid = req.uid();
+        let req_gid = req.gid();
+        task::spawn(async move {
+            match fs.link(ino, parent, &name, req_uid, req_gid).await {
+                Ok(attr) => {
+                    debug!(logger, "Successfully created new link";
+                        "function" => "link",
+                        "ino" => ino,
+                        "parent" => parent,
+                        "name" => ?name
+                    );
+                    reply.entry(&Duration::new(1, 0), &attr, 0);
+                },
+                Err(error_code) => {
+                    error!(logger, "Failed to create new link";
+                        "function" => "link",
+                        "ino" => ino,
+                        "parent" => parent,
+                        "name" => ?name,
+                        "error_code" => error_code
+                    );
+                    reply.error(error_code);
+                }
+            }
+        });
+    }
 
     fn unlink(&mut self, req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
         let fs = self.clone();
