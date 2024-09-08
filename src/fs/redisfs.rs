@@ -13,10 +13,13 @@ use slog_envlogger;
 use std::sync::Arc;
 use libc::{EINVAL, ENOTEMPTY};
 use std::collections::HashMap;
+use std::time::{SystemTime, Duration};
+use fuser::FileType;
 
 pub struct RedisFs {
     redis_client: ConnectionManager,
     pub logger: Arc<Logger>,
+    block_size: u64,
 }
 
 impl Clone for RedisFs {
@@ -24,12 +27,13 @@ impl Clone for RedisFs {
         RedisFs {
             redis_client: self.redis_client.clone(),
             logger: Arc::clone(&self.logger),
+            block_size: self.block_size,
         }
     }
 }
 
 impl RedisFs {
-    pub async fn new(redis_url: &str) -> Result<Self, Box<dyn Error>> {
+    pub async fn new(redis_url: &str, block_size: u64) -> Result<Self, Box<dyn Error>> {
         let file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -62,6 +66,7 @@ impl RedisFs {
         let fs = RedisFs { 
             redis_client,
             logger,
+            block_size,
         };
         fs.ensure_root_inode().await?;
         Ok(fs)
@@ -160,7 +165,7 @@ impl RedisFs {
         let mut conn = self.redis_client.clone();
 
         let attr_key = format!("inode:{}", ino);
-        let attr: std::collections::HashMap<String, String> = conn.hgetall(&attr_key).await.map_err(|e| {
+        let attr: HashMap<String, String> = conn.hgetall(&attr_key).await.map_err(|e| {
             slog::error!(self.logger, "Failed to get inode attributes"; "inode" => ino, "error" => ?e, "function" => "get_attr");
             EIO
         })?;
@@ -170,26 +175,37 @@ impl RedisFs {
             return Err(ENOENT);
         }
 
-        let now = std::time::SystemTime::now();
+        let parse_time = |s: Option<&String>| {
+            s.and_then(|t| t.parse::<u64>().ok())
+                .map(|t| SystemTime::UNIX_EPOCH + Duration::from_secs(t))
+                .unwrap_or_else(SystemTime::now)
+        };
+
         let attr = FileAttr {
             ino,
             size: attr.get("size").and_then(|s| s.parse().ok()).unwrap_or(0),
-            blocks: 1,
-            atime: now,
-            mtime: now,
-            ctime: now,
-            crtime: now,
-            kind: match attr.get("filetype").and_then(|t| t.parse::<u32>().ok()).unwrap_or(4) {
-                3 => fuser::FileType::Directory,
-                _ => fuser::FileType::RegularFile,
+            blocks: attr.get("blocks").and_then(|s| s.parse().ok()).unwrap_or(1),
+            atime: parse_time(attr.get("atime")),
+            mtime: parse_time(attr.get("mtime")),
+            ctime: parse_time(attr.get("ctime")),
+            crtime: parse_time(attr.get("crtime")),
+            kind: match attr.get("kind").and_then(|t| t.parse::<u32>().ok()).unwrap_or(0) {
+                1 => FileType::NamedPipe,
+                2 => FileType::CharDevice,
+                3 => FileType::BlockDevice,
+                4 => FileType::Directory,
+                5 => FileType::RegularFile,
+                6 => FileType::Symlink,
+                7 => FileType::Socket,
+                _ => FileType::RegularFile,
             },
-            perm: attr.get("mode").and_then(|m| m.parse().ok()).unwrap_or(0o644),
+            perm: attr.get("perm").and_then(|m| m.parse().ok()).unwrap_or(0o644),
             nlink: attr.get("nlink").and_then(|n| n.parse().ok()).unwrap_or(1),
             uid: attr.get("uid").and_then(|u| u.parse().ok()).unwrap_or(0),
             gid: attr.get("gid").and_then(|g| g.parse().ok()).unwrap_or(0),
-            rdev: 0,
-            flags: 0,
-            blksize: 4096,
+            rdev: attr.get("rdev").and_then(|r| r.parse().ok()).unwrap_or(0),
+            flags: attr.get("flags").and_then(|f| f.parse().ok()).unwrap_or(0),
+            blksize: self.block_size as u32,
         };
 
         slog::debug!(self.logger, "Successfully got inode attributes"; "inode" => ino, "attr" => ?attr, "function" => "get_attr");
@@ -270,42 +286,100 @@ impl RedisFs {
         Ok(data)
     }
 
-    pub async fn write_file(&self, ino: u64, offset: i64, data: &[u8], uid: u32, gid: u32) -> Result<u32, i32> {
-        let attr = self.get_attr(ino).await?;
-        
+    pub async fn write_file_blocks(&self, ino: u64, offset: i64, data: &[u8], uid: u32, gid: u32) -> Result<u64, i32> {
+        let mut conn = self.redis_client.clone();
+        let file_key = format!("inode:{}", ino);
+        let attr: FileAttr = conn.hgetall(&file_key).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to get inode attributes"; "inode" => ino, "error" => ?e, "function" => "write_file_blocks");
+            EIO
+        }).and_then(|data: HashMap<String, String>| {
+            // Convert the HashMap to FileAttr
+            use std::time::{SystemTime, Duration};
+            use fuser::FileType;
+
+            Ok(FileAttr {
+                ino: ino,
+                size: data.get("size").and_then(|s| s.parse().ok()).unwrap_or(0),
+                blocks: data.get("blocks").and_then(|s| s.parse().ok()).unwrap_or(0),
+                atime: SystemTime::UNIX_EPOCH + Duration::from_secs(data.get("atime").and_then(|s| s.parse().ok()).unwrap_or(0)),
+                mtime: SystemTime::UNIX_EPOCH + Duration::from_secs(data.get("mtime").and_then(|s| s.parse().ok()).unwrap_or(0)),
+                ctime: SystemTime::UNIX_EPOCH + Duration::from_secs(data.get("ctime").and_then(|s| s.parse().ok()).unwrap_or(0)),
+                crtime: SystemTime::UNIX_EPOCH + Duration::from_secs(data.get("crtime").and_then(|s| s.parse().ok()).unwrap_or(0)),
+                kind: data.get("kind").and_then(|s| s.parse().ok()).map(|k: u32| match k {
+                    1 => FileType::NamedPipe,
+                    2 => FileType::CharDevice,
+                    3 => FileType::BlockDevice,
+                    4 => FileType::Directory,
+                    5 => FileType::RegularFile,
+                    6 => FileType::Symlink,
+                    7 => FileType::Socket,
+                    _ => FileType::RegularFile,
+                }).unwrap_or(FileType::RegularFile),
+                perm: data.get("perm").and_then(|s| s.parse().ok()).unwrap_or(0o644),
+                nlink: data.get("nlink").and_then(|s| s.parse().ok()).unwrap_or(1),
+                uid: data.get("uid").and_then(|s| s.parse().ok()).unwrap_or(0),
+                gid: data.get("gid").and_then(|s| s.parse().ok()).unwrap_or(0),
+                rdev: data.get("rdev").and_then(|s| s.parse().ok()).unwrap_or(0),
+                flags: data.get("flags").and_then(|s| s.parse().ok()).unwrap_or(0),
+                blksize: self.block_size as u32,
+            })
+        })?;
+
         if !self.check_permission(&attr, uid, gid, 2) {  // 2 is for write permission
-            slog::warn!(self.logger, "Insufficient permissions to write file"; "inode" => ino, "uid" => uid, "gid" => gid, "function" => "write_file");
+            slog::warn!(self.logger, "Insufficient permissions to write file"; "inode" => ino, "uid" => uid, "gid" => gid, "function" => "write_file_blocks");
             return Err(libc::EACCES);
         }
 
-        let mut conn = self.redis_client.clone();
+        let start_block = (offset as u64) / self.block_size;
+        let end_block = ((offset as u64 + data.len() as u64 - 1) / self.block_size).max(start_block);
 
-        let file_key = format!("inode:{}:data", ino);
-        let file_size: u64 = conn.get(&file_key).await.unwrap_or(0);
+        let mut bytes_written = 0;
+        for block in start_block..=end_block {
+            let block_offset = block * self.block_size;
+            let data_offset = block_offset.saturating_sub(offset as u64) as usize;
+            let block_start = offset.max(block_offset as i64) as usize - offset as usize;
+            let block_end = ((block + 1) * self.block_size).min(offset as u64 + data.len() as u64) as usize - offset as usize;
+            
+            let block_data = &data[block_start..block_end];
+            let block_key = format!("inode:{}:block:{}", ino, block);
 
-        let new_size = std::cmp::max(file_size, (offset as u64) + (data.len() as u64));
-        let mut file_content = vec![0u8; new_size as usize];
+            // Check if we need to read the existing block
+            let need_read = data_offset != 0 || block_data.len() != self.block_size as usize;
+            let block_exists = block_offset < attr.size;
 
-        if file_size > 0 {
-            let existing_content: Vec<u8> = conn.get(&file_key).await.map_err(|e| {
-                slog::error!(self.logger, "Failed to read file content"; "inode" => ino, "error" => ?e, "function" => "write_file");
+            let mut existing_block = if need_read && block_exists {
+                match conn.get::<_, Vec<u8>>(&block_key).await {
+                    Ok(block_content) => block_content,
+                    Err(_) => vec![0; self.block_size as usize],
+                }
+            } else {
+                vec![0; self.block_size as usize]
+            };
+
+            if existing_block.len() < self.block_size as usize {
+                existing_block.resize(self.block_size as usize, 0);
+            }
+
+            existing_block.splice(data_offset..data_offset+block_data.len(), block_data.iter().cloned());
+
+            conn.set(&block_key, &existing_block).await.map_err(|e| {
+                slog::error!(self.logger, "Failed to write file block"; "inode" => ino, "block" => block, "error" => ?e, "function" => "write_file_blocks");
                 EIO
             })?;
-            file_content[..file_size as usize].copy_from_slice(&existing_content);
+            bytes_written += block_data.len() as u64;
         }
 
-        file_content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
-
-        conn.set(&file_key, &file_content).await.map_err(|e| {
-            slog::error!(self.logger, "Failed to write file content"; "inode" => ino, "error" => ?e, "function" => "write_file");
+        let new_size = attr.size.max(offset as u64 + bytes_written);
+        let new_mtime = std::time::SystemTime::now();
+        conn.hset_multiple(&file_key, &[
+            ("size", new_size.to_string()),
+            ("mtime", new_mtime.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs().to_string()),
+        ]).await.map_err(|e| {
+            slog::error!(self.logger, "Failed to update inode attributes"; "inode" => ino, "error" => ?e, "function" => "write_file_blocks");
             EIO
         })?;
 
-        // Update file size
-        self.set_attr_opt(ino, None, None, None, Some(new_size), None).await?;
-
-        slog::debug!(self.logger, "Successfully wrote to file"; "inode" => ino, "offset" => offset, "bytes_written" => data.len(), "function" => "write_file");
-        Ok(data.len() as u32)
+        Ok(bytes_written)
     }
 
     pub async fn create_file(&self, parent: u64, name: &OsStr, mode: u32, umask: u32, flags: i32, uid: u32, gid: u32) -> Result<(u64, FileAttr), i32> {
@@ -341,7 +415,7 @@ impl RedisFs {
             gid,
             rdev: 0,
             flags: flags as u32,
-            blksize: 4096,
+            blksize: self.block_size as u32,
         };
 
         // Store the new file's attributes in Redis
@@ -408,7 +482,7 @@ impl RedisFs {
             gid,
             rdev: 0,
             flags: 0,
-            blksize: 4096,
+            blksize: self.block_size as u32,
         };
 
         // Set attributes for the new directory

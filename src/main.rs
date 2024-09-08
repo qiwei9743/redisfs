@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match &cli.command {
         Commands::Mount { redis_url, mountpoint } => {
             // 创建RedisFs实例
-            let redis_fs = match RedisFs::new(redis_url).await {
+            let redis_fs = match RedisFs::new(redis_url, 4096).await {
                 Ok(fs) => fs,
                 Err(e) => {
                     eprintln!("无法创建RedisFs实例: {}", e);

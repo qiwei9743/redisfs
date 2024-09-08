@@ -4,7 +4,7 @@ use tokio::task;
 use crate::fs::redisfs::RedisFs;
 use std::time::Duration;
 use std::ffi::OsStr;
-use libc::ENOENT;
+
 
 use slog::{debug, warn, error};
 
@@ -64,7 +64,7 @@ impl Filesystem for RedisFs {
                         "ino" => ino,
                         "attr" => ?attr
                     );
-                    reply.attr(&Duration::new(0, 0), &attr);
+                    reply.attr(&Duration::new(1, 0), &attr);
                 }
                 Err(e) => {
                     error!(logger, "Failed to retrieve ino attributes"; 
@@ -72,7 +72,7 @@ impl Filesystem for RedisFs {
                         "ino" => ino,
                         "error" => ?e
                     );
-                    reply.error(ENOENT);
+                    reply.error(e);
                 }
             }
         });
@@ -227,7 +227,7 @@ impl Filesystem for RedisFs {
         let req_uid = req.uid();
         let req_gid = req.gid();
         task::spawn(async move {
-            match fs.write_file(ino, offset, &data, req_uid, req_gid).await {
+            match fs.write_file_blocks(ino, offset, &data, req_uid, req_gid).await {
                 Ok(bytes_written) => {
                     debug!(logger, "Successfully wrote to file";
                         "function" => "write",
