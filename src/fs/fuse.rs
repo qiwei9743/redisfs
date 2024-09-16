@@ -1,12 +1,15 @@
 use fuser::{Filesystem, Request, ReplyAttr, ReplyEntry, ReplyCreate, ReplyWrite, ReplyData, ReplyEmpty};
 use tokio::task;
 
-use crate::fs::redisfs::RedisFs;
+use crate::fs::fs_impl::RedisFs;
+
 use std::time::Duration;
 use std::ffi::OsStr;
-
+use crate::fs::fs_impl::FileOptionAttr;
 
 use slog::{debug, warn, error};
+
+
 
 impl Filesystem for RedisFs {
     fn setattr(
@@ -27,18 +30,48 @@ impl Filesystem for RedisFs {
         flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let fs = self.clone();
         let logger = self.logger.clone();
+        let fs = self.clone();
         
         task::spawn(async move {
-            match fs.set_attr_opt(ino, mode, uid, gid, size, flags).await {
-                Ok(attr) => {
-                    debug!(logger, "Successfully set ino attributes"; 
-                        "function" => "setattr",
-                        "ino" => ino,
-                        "attr" => ?attr
-                    );
-                    reply.attr(&Duration::new(0, 0), &attr);
+            let attr = FileOptionAttr {
+                ino: Some(ino),
+                size,
+                blocks: None,
+                atime: None,
+                mtime: None,
+                ctime: None,
+                crtime: None,
+                kind: None,
+                perm: mode.map(|m| m as u16),
+                nlink: None,
+                uid,
+                gid,
+                rdev: None,
+                blksize: None,
+                flags,
+            };
+
+            match fs.set_attr(ino, &attr).await {
+                Ok(_) => {
+                    match fs.get_attr(ino).await {
+                        Ok(attr) => {
+                            debug!(logger, "Successfully set ino attributes"; 
+                                "function" => "setattr",
+                                "ino" => ino,
+                                "attr" => ?attr
+                            );
+                            reply.attr(&Duration::new(0, 0), &attr);
+                        },
+                        Err(error_code) => {
+                            error!(logger, "Failed to get ino attributes after setting"; 
+                                "function" => "setattr",
+                                "ino" => ino,
+                                "error_code" => error_code
+                            );
+                            reply.error(error_code);
+                        }
+                    }
                 },
                 Err(error_code) => {
                     error!(logger, "Failed to set ino attributes"; 
@@ -289,6 +322,7 @@ impl Filesystem for RedisFs {
             }
         });
     }
+
     fn link(&mut self, req: &Request<'_>, ino: u64, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let fs = self.clone();
         let logger = self.logger.clone();

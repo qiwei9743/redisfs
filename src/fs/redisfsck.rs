@@ -10,6 +10,7 @@ pub struct RedisFsck {
     logger: Arc<Logger>,
 }
 
+
 impl RedisFsck {
     pub async fn new(redis_url: &str) -> Result<Self, Box<dyn Error>> {
         // 创建日志记录器
