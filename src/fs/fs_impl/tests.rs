@@ -440,3 +440,114 @@ async fn test_write_and_read_boundary_conditions() {
     // 删除文件
     fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
 }
+
+#[tokio::test]
+async fn test_write_and_verify_file_attr() {
+    println!("Starting test_write_and_verify_file_attr");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // root directory
+    let name = OsString::from("test_write_attr.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;  // root user
+    let gid = 0;  // root group
+
+    // Create file
+    let (ino, attr_before) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 等待一小段时间，确保时间戳有变化
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    // Write data
+    let data = b"Hello, World!";
+    let bytes_written = fs.write_file_blocks(ino, 0, data, uid, gid).await.expect("Failed to write file");
+    assert_eq!(bytes_written, data.len() as u64);
+
+    // Get file attributes after write
+    let attr_after = fs.get_attr(ino).await.expect("Failed to get file attributes");
+
+    // Verify file size
+    assert_eq!(attr_after.size, data.len() as u64);
+    assert!(attr_after.size > attr_before.size);
+
+    // Verify modification time
+    assert!(attr_after.mtime > attr_before.mtime);
+
+    // Verify change time
+    assert!(attr_after.ctime > attr_before.ctime);
+
+    // Delete file
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_sparse_write_and_read() {
+    println!("Starting test_sparse_write_and_read");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // root directory
+    let name = OsString::from("test_sparse.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;  // root user
+    let gid = 0;  // root group
+
+    // Create file
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // Write data with holes
+    let data1 = b"First chunk of data";
+    let data2 = b"Second chunk of data";
+    let offset1 = 0i64;
+    let offset2 = 8192i64; // 2 blocks away
+
+    fs.write_file_blocks(ino, offset1, data1, uid, gid).await.expect("Failed to write first chunk");
+    fs.write_file_blocks(ino, offset2, data2, uid, gid).await.expect("Failed to write second chunk");
+
+    // Get file attributes to check the actual file size
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    let file_size = attr.size;
+
+    println!("File size after writes: {}", file_size);
+
+    // Read entire file
+    let read_data = fs.read_file(ino, 0, file_size as u32, uid, gid).await.expect("Failed to read file");
+
+    println!("Read data length: {}", read_data.len());
+
+    // Verify data
+    assert_eq!(&read_data[offset1 as usize..offset1 as usize + data1.len()], data1);
+    assert_eq!(&read_data[offset2 as usize..offset2 as usize + data2.len()], data2);
+
+    // Verify holes
+    assert!(read_data[data1.len()..offset2 as usize].iter().all(|&x| x == 0));
+
+    // Overwrite part of the hole
+    let data3 = b"Overwriting hole";
+    let offset3 = 4096i64; // In the middle of the hole
+    fs.write_file_blocks(ino, offset3, data3, uid, gid).await.expect("Failed to write third chunk");
+
+    // Get updated file attributes
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    let file_size = attr.size;
+
+    println!("File size after overwrite: {}", file_size);
+
+    // Read entire file again
+    let read_data = fs.read_file(ino, 0, file_size as u32, uid, gid).await.expect("Failed to read file");
+
+    println!("Read data length after overwrite: {}", read_data.len());
+
+    // Verify all data
+    assert_eq!(&read_data[offset1 as usize..offset1 as usize + data1.len()], data1);
+    assert_eq!(&read_data[offset3 as usize..offset3 as usize + data3.len()], data3);
+    assert_eq!(&read_data[offset2 as usize..offset2 as usize + data2.len()], data2);
+
+    // Verify remaining holes
+    assert!(read_data[data1.len()..offset3 as usize].iter().all(|&x| x == 0));
+    assert!(read_data[offset3 as usize + data3.len()..offset2 as usize].iter().all(|&x| x == 0));
+
+    // Delete file
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}

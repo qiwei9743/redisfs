@@ -67,7 +67,7 @@ impl Filesystem for RedisFs {
                             error!(logger, "Failed to get ino attributes after setting"; 
                                 "function" => "setattr",
                                 "ino" => ino,
-                                "error_code" => error_code
+                                "error_code" => error_code.to_string()
                             );
                             reply.error(error_code);
                         }
@@ -77,7 +77,7 @@ impl Filesystem for RedisFs {
                     error!(logger, "Failed to set ino attributes"; 
                         "function" => "setattr",
                         "ino" => ino,
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }
@@ -132,7 +132,7 @@ impl Filesystem for RedisFs {
                         "function" => "lookup",
                         "parent" => parent,
                         "name" => ?name,
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code)
                 },
@@ -163,7 +163,7 @@ impl Filesystem for RedisFs {
                         "function" => "create",
                         "parent_ino" => parent,
                         "file_name" => ?name,
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }
@@ -194,7 +194,7 @@ impl Filesystem for RedisFs {
                         "function" => "mkdir",
                         "parent_ino" => parent, 
                         "directory_name" => ?name, 
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }
@@ -215,7 +215,9 @@ impl Filesystem for RedisFs {
                     for (i, (ino, name, attr)) in entries.into_iter().enumerate() {
                         let offset = (i + 1) as i64; // Offset starts from 1
                         let kind = attr.kind;
-                        debug!(logger, "Adding entry to reply"; "ino" => ino, "name" => ?name, "kind" => ?kind);
+                        debug!(logger, "Adding entry to reply"; "ino" => ?ino);
+                            //"name" => name.to_string_lossy(),   
+                            //"kind" => ?kind);
                         let full = reply.add(ino, offset, kind, name);
                         if full {
                             debug!(logger, "Reply buffer full, breaking"; "last_ino" => ino);
@@ -233,7 +235,7 @@ impl Filesystem for RedisFs {
                     error!(logger, "Failed to read directory"; 
                         "function" => "readdir",
                         "ino" => ino, 
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }
@@ -264,10 +266,9 @@ impl Filesystem for RedisFs {
                 Ok(bytes_written) => {
                     debug!(logger, "Successfully wrote to file";
                         "function" => "write",
-                        "ino" => ino,
-                        "offset" => offset,
-                        "bytes_written" => bytes_written
-                    );
+                        "ino" => ?ino,
+                        "offset" => ?offset,
+                        "bytes_written" => ?bytes_written);
                     reply.written(bytes_written as u32);
                 },
                 Err(error_code) => {
@@ -275,7 +276,7 @@ impl Filesystem for RedisFs {
                         "function" => "write",
                         "ino" => ino,
                         "offset" => offset,
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }
@@ -315,7 +316,7 @@ impl Filesystem for RedisFs {
                         "function" => "read",
                         "ino" => ino,
                         "offset" => offset,
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }
@@ -347,7 +348,7 @@ impl Filesystem for RedisFs {
                         "ino" => ino,
                         "parent" => parent,
                         "name" => ?name,
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }
@@ -377,7 +378,7 @@ impl Filesystem for RedisFs {
                         "function" => "unlink",
                         "parent" => parent,
                         "name" => ?name,
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }
@@ -407,7 +408,7 @@ impl Filesystem for RedisFs {
                         "function" => "rmdir",
                         "parent" => parent,
                         "name" => ?name,
-                        "error_code" => error_code
+                        "error_code" => error_code.to_string()
                     );
                     reply.error(error_code);
                 }

@@ -19,6 +19,7 @@ use futures::future::join_all;
 
 
 mod metadata;
+
 pub use metadata::FileOptionAttr;
 
 pub struct RedisFs {
@@ -279,7 +280,7 @@ impl RedisFs {
             "function" => "read_file",
             "inode" => ino, 
             "offset" => offset,
-            "size" => size,
+            "read_size" => size,
             "file_size" => file_size
         );
 
@@ -289,17 +290,22 @@ impl RedisFs {
 
         let start_block = (offset as u64) / self.block_size;
         let end_block = ((offset as u64 + size as u64 - 1) / self.block_size).min((file_size - 1) / self.block_size);
-
+        slog::debug!(self.logger, "Reading file blocks"; "start_block" => start_block, "end_block" => end_block, "function" => "read_file");
+        
         let mut data = Vec::new();
         for block in start_block..=end_block {
             let block_key = metadata::inode_block_key(ino, block);
-            let block_data: Vec<u8> = match conn.get(&block_key).await {
-                Ok(data) => data,
-                Err(e) => {
-                    slog::error!(self.logger, "Failed to read file block"; "inode" => ino, "block" => block, "error" => ?e, "function" => "read_file");
-                    return Err(EIO);
-                }
-            };
+            let block_data: Option<Vec<u8>> = conn.get(&block_key).await.map_err(|e| {
+                slog::error!(self.logger, "Failed to read file block"; "inode" => ino, "block" => block, "error" => ?e, "function" => "read_file");
+                EIO
+            })?;
+
+            let mut block_data = block_data.unwrap_or_else(|| Vec::new());
+            
+            // 如果块的实际大小小于预期的块大小，用零填充
+            if block_data.len() < self.block_size as usize {
+                block_data.resize(self.block_size as usize, 0);
+            }
 
             let block_offset = block * self.block_size;
             let start = if block == start_block {
@@ -312,7 +318,7 @@ impl RedisFs {
                 ((offset as u64 + size as u64).min(file_size) - block_offset) as usize
             } else {
                 self.block_size as usize
-            }.min(block_data.len());
+            };
 
             data.extend_from_slice(&block_data[start..end]);
 
@@ -326,29 +332,21 @@ impl RedisFs {
                 "data_len" => data.len()
             );
 
-            if data.len() as u32 >= size {
+            if data.len() as u64 >= size as u64 {
                 break;
             }
         }
 
         // Trim the data if we've read more than requested
-        if data.len() as u32 > size {
+        let read_size = (size as u64).min(file_size - offset as u64);
+        if data.len() as u64 > read_size {
             slog::debug!(self.logger, "Truncating read data"; 
                 "function" => "read_file",
                 "inode" => ino,
                 "original_size" => data.len(),
-                "truncated_size" => size
+                "truncated_size" => read_size
             );
-            data.truncate(size as usize);
-        }
-
-        if data.len() < size as usize {
-            slog::warn!(self.logger, "Read less data than expected"; 
-                "function" => "read_file",
-                "inode" => ino,
-                "expected_size" => size,
-                "actual_size" => data.len()
-            );
+            data.truncate(read_size as usize);
         }
 
         slog::debug!(self.logger, "Successfully read file"; "inode" => ino, "offset" => offset, "bytes_read" => data.len(), "function" => "read_file");
@@ -406,9 +404,11 @@ impl RedisFs {
         } else {
             None
         };
+        let now = std::time::SystemTime::now();
         let attr = metadata::FileOptionAttr{
             size: new_size,
-            mtime: Some(std::time::SystemTime::now()),
+            mtime: Some(now),
+            ctime: Some(now),  // 更新 ctime
             ..Default::default()
         };
         self.set_attr(ino, &attr).await?;
@@ -737,4 +737,3 @@ impl RedisFs {
 
 #[cfg(test)]
 mod tests;
-
