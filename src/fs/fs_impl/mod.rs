@@ -45,7 +45,7 @@ fn offset2blockno(offset: u64, block_size: u64) -> u64 {
 async fn write_block(conn: &ConnectionManager, logger: &Logger, 
         offset: u64, ino: u64, data: &[u8], offset_in_block: u64, read_existing: bool, block_size: u64) -> Result<u64, i32> {
     let block_key = metadata::inode_block_key(ino, offset / block_size);
-    if data.len() == block_size as usize || offset_in_block == 0 {
+    if data.len() == block_size as usize && offset_in_block == 0 {
         conn.clone().set(block_key.as_str(), data).await.map_err(|e| {
             slog::error!(logger, "Failed to write [full or offset=0] block"; "inode" => ino, "error" => ?e, 
             "function" => "write_block", "block_key" => block_key.as_str(), "offset" => offset, "block_size" => block_size,
@@ -53,6 +53,8 @@ async fn write_block(conn: &ConnectionManager, logger: &Logger,
         );
             EIO
         })?;
+        slog::debug!(logger, "Wrote block"; "inode" => ino, "blockno" => offset / block_size, "block_key" => block_key.as_str(), "offset" => offset, "block_size" => block_size,
+            "data_len" => data.len(), "new_block_data" => format!("{:?}", data));
         return Ok(data.len() as u64);
     }
 
@@ -78,7 +80,9 @@ async fn write_block(conn: &ConnectionManager, logger: &Logger,
         data.iter().cloned());
 
     let new_block = old_block;
-
+    slog::debug!(logger, "Writing block"; "inode" => ino, "blockno" => offset / block_size, "block_key" => block_key.as_str(), "offset" => offset, "block_size" => block_size,
+        "data_len" => data.len(), "new_block_len" => new_block.len(), "read_existing" => read_existing, "offset_in_block" => offset_in_block,
+        "new_block_data" => format!("{:?}", new_block.as_slice()));
     conn.clone().set(block_key.as_str(), new_block).await.map_err(|e| {
         slog::error!(logger, "Failed to write file block"; "inode" => ino, "error" => ?e, "function" => "write_partial_block");
         EIO
@@ -367,7 +371,7 @@ impl RedisFs {
             return Err(libc::EACCES);
         }
 
-        let mut futures = Vec::new();
+        let mut futures_vec = Vec::new();
 
         
         if offset as u64 % self.block_size != 0  {
@@ -376,8 +380,8 @@ impl RedisFs {
             let write_size = std::cmp::min(data.len(), self.block_size as usize - offset_in_block as usize);
             let read_existing = attr.size > 0 && offset2blockno(offset as u64 + write_size as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
             let r= write_block(&conn, &self.logger, offset as u64, ino,
-                &data[..write_size], offset_in_block, read_existing, self.block_size);
-            futures.push(r);
+                &data[..write_size], offset_in_block, read_existing, self.block_size).await;
+            futures_vec.push(r);
 
             offset = offset + write_size as i64;
             data = &data[write_size..];
@@ -386,22 +390,24 @@ impl RedisFs {
         while data.len() >= self.block_size as usize {
             let read_existing = attr.size > 0 && offset2blockno(offset as u64 + self.block_size as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
             let r = write_block(&conn, &self.logger, offset as u64, ino,
-                &data[..self.block_size as usize], 0, read_existing, self.block_size);
+                &data[..self.block_size as usize], 0, read_existing, self.block_size).await;
             
-            futures.push(r);
+            futures_vec.push(r);
             offset += self.block_size as i64;
             data = &data[self.block_size as usize..];
         }
         if data.len() > 0 {
             // handle last block
             let read_existing = attr.size > 0 && offset2blockno(offset as u64 + data.len() as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
+            slog::debug!(self.logger, "Writing last block"; "function" => "write_file_blocks", "inode" => ino, "offset" => offset, "data_len" => data.len(), "read_existing" => read_existing);
             let r = write_block(&conn, &self.logger, offset as u64, ino,
-                &data[..], 0, read_existing, self.block_size);
-            futures.push(r);
+                &data[..], 0, read_existing, self.block_size).await;
+            futures_vec.push(r);
         }
 
-        slog::debug!(self.logger, "Executing write futures"; "function" => "write_file_blocks", "future_cnt" => futures.len());
-        let write_bytes = self.execute_write_futures(futures).await?;
+        slog::debug!(self.logger, "Executing write futures"; "function" => "write_file_blocks", "future_cnt" => futures_vec.len());
+        //let write_bytes = self.execute_write_futures(futures).await?;
+        let write_bytes = futures_vec.iter().map(|r| r.unwrap()).sum::<u64>();
         assert!(write_bytes == data1.len() as u64, "write_bytes: {}, data_len: {}", write_bytes, data1.len());
 
         let new_size = if attr.size < offset1 as u64 + data1.len() as u64 {

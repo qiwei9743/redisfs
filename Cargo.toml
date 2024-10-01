@@ -5,19 +5,20 @@ edition = "2021"
 
 [dependencies]
 fuser = "0.14"
-libc = "0.2"
+libc = "0.2.159"
 tokio = { version = "1", features = ["full", "test-util"] }
 slog = "2.7"
 slog-term = "2.9"
 slog-async = "2.7"
 slog-scope = "4.4"
-redis = { version = "0.27.0", features = ["tokio-comp", "aio", "connection-manager"] }
+redis = { version = "0.27.2", features = ["tokio-comp", "aio", "connection-manager"] }
 env_logger = "0.11.5"
-snafu = "0.8.4"
+snafu = "0.8.5"
 slog-envlogger = "2.2.0"
-clap = { version = "4.5.17", features = ["derive"] }
+clap = { version = "4.5.18", features = ["derive"] }
 futures = "0.3.30"
 
 mockall = "0.13.0"
 
-async-trait = "0.1.68"
+async-trait = "0.1.83"
+rand = "0.8.5"

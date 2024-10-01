@@ -1,8 +1,8 @@
 use super::*;
 use tokio;
 use std::ffi::OsString;
-
-use redis::AsyncCommands; // Ensure the necessary traits are in scope
+use redis::AsyncCommands;
+use rand::Rng;
 
 async fn create_test_redisfs() -> RedisFs {
     let redis_url = "redis://127.0.0.1/";
@@ -832,6 +832,172 @@ async fn test_write_read_and_verify_file_size() {
     // 再次获取文件属性，确保大小没有变化
     let attr_after_read = fs.get_attr(ino).await.expect("Failed to get file attributes after read");
     assert_eq!(attr_after_read.size, attr.size, "File size changed after read");
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_write_and_read_with_overlapping_blocks() {
+    println!("开始测试：跨块写入和读取");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_overlapping_blocks.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;
+    let gid = 0;
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 写入跨越多个块的数据
+    let data = vec![0xAA; 8192]; // 8KB 数据，跨越两个 4KB 块
+    let bytes_written = fs.write_file_blocks(ino, 0, &data, uid, gid).await.expect("Failed to write file");
+    assert_eq!(bytes_written, data.len() as u64);
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    assert_eq!(attr.size, data.len() as u64);
+
+    // 读取并验证数据
+    let read_data = fs.read_file(ino, 0, data.len() as u32, uid, gid).await.expect("Failed to read file");
+    assert_eq!(read_data, data, "Read data does not match written data");
+    assert_eq!(attr.size, data.len() as u64);
+    // assert_eq!(attr.blocks, 2);
+    assert_eq!(read_data, data);
+
+    // 写入部分覆盖两个块的数据
+    let overlap_data = vec![0xBB; 2048]; // 2KB 数据
+    let overlap_offset = 3072; // 从第一个块的 3KB 处开始写入
+    fs.write_file_blocks(ino, overlap_offset, &overlap_data, uid, gid).await.expect("Failed to write overlapping data");
+
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    assert_eq!(attr.size, data.len() as u64);
+
+    // 读取并验证覆盖后的数据
+    let read_data = fs.read_file(ino, 0, data.len() as u32, uid, gid).await.expect("Failed to read file after overlap write");
+    assert_eq!(&read_data[..overlap_offset as usize], &data[..overlap_offset as usize], "Data before overlap should remain unchanged");
+    assert_eq!(&read_data[overlap_offset as usize..(overlap_offset + overlap_data.len() as i64) as usize], &overlap_data, "Overlapped data should match written data");
+    assert_eq!(&read_data[(overlap_offset + overlap_data.len() as i64) as usize..], &data[(overlap_offset + overlap_data.len() as i64) as usize..], "Data after overlap should remain unchanged");
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_write_read_with_non_block_aligned_sizes() {
+    println!("开始测试：非块对齐大小的写入和读取");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_non_aligned_sizes.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;
+    let gid = 0;
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 写入非块对齐大小的数据
+    let data1 = vec![0xCC; 3000]; // 3000 字节，不是 4KB 的倍数
+    let bytes_written = fs.write_file_blocks(ino, 0, &data1, uid, gid).await.expect("Failed to write first data");
+    assert_eq!(bytes_written, data1.len() as u64);
+
+    // 读取并验证数据
+    let read_data1 = fs.read_file(ino, 0, data1.len() as u32, uid, gid).await.expect("Failed to read first data");
+    assert_eq!(read_data1, data1, "Read data1 does not match written data1");
+
+    // 写入另一个非块对齐大小的数据，部分覆盖第一次写入的数据
+    let data2 = vec![0xDD; 2500]; // 2500 字节
+    let offset2 = 2000; // 从 2000 字节处开始写入
+    fs.write_file_blocks(ino, offset2, &data2, uid, gid).await.expect("Failed to write second data");
+
+    // 读取并验证最终数据
+    let total_size = (offset2 + data2.len() as i64) as u32;
+    let read_data_final = fs.read_file(ino, 0, total_size, uid, gid).await.expect("Failed to read final data");
+
+    assert_eq!(&read_data_final[..offset2 as usize], &data1[..offset2 as usize], "Data before second write should remain unchanged");
+    assert_eq!(&read_data_final[offset2 as usize..], &data2, "Data after second write should match data2");
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_write_read_with_large_offset() {
+    println!("开始测试：大偏移量的写入和读取");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_large_offset.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;
+    let gid = 0;
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 在大偏移量处写入数据
+    let large_offset = 1_000_000; // 1MB 偏移
+    let data = vec![0xEE; 4096]; // 4KB 数据
+    fs.write_file_blocks(ino, large_offset, &data, uid, gid).await.expect("Failed to write data at large offset");
+
+    // 读取并验证数据
+    let read_data = fs.read_file(ino, large_offset, data.len() as u32, uid, gid).await.expect("Failed to read data from large offset");
+    assert_eq!(read_data, data, "Read data does not match written data at large offset");
+
+    // 验证文件大小
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    assert_eq!(attr.size, (large_offset + data.len() as i64) as u64, "File size incorrect after write at large offset");
+
+    // 读取文件开始到写入数据之间的内容（应该是空洞）
+    let hole_data = fs.read_file(ino, 0, large_offset as u32, uid, gid).await.expect("Failed to read hole data");
+    assert!(hole_data.iter().all(|&x| x == 0), "Hole data should be all zeros");
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_multiple_small_writes_and_reads() {
+    println!("开始测试：多次小规模写入和读取");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_multiple_small_writes.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;
+    let gid = 0;
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    let mut expected_data = Vec::new();
+    let write_count = 100;
+    let write_size = 100;
+
+    // 执行多次小规模写入
+    for i in 0..write_count {
+        let data = vec![(i % 256) as u8; write_size];
+        let offset = i * write_size;
+        fs.write_file_blocks(ino, offset as i64, &data, uid, gid).await.expect("Failed to write small data");
+        expected_data.extend_from_slice(&data);
+    }
+
+    // 读取整个文件并验证
+    let total_size = write_count * write_size;
+    let read_data = fs.read_file(ino, 0, total_size as u32, uid, gid).await.expect("Failed to read entire file");
+    assert_eq!(read_data, expected_data, "Read data does not match expected data after multiple small writes");
+
+    // 随机读取验证
+    for _ in 0..10 {
+        let random_offset = rand::thread_rng().gen_range(0..(total_size - write_size));
+        let read_data = fs.read_file(ino, random_offset as i64, write_size as u32, uid, gid).await.expect("Failed to read random segment");
+        assert_eq!(read_data, &expected_data[random_offset..random_offset + write_size], "Random read data does not match expected data");
+    }
 
     // 删除文件
     fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
