@@ -225,6 +225,12 @@ async fn test_write_and_read_large_file() {
     let read_data = fs.read_file(ino, 0, data.len() as u32, uid, gid).await.expect("Failed to read file");
     assert_eq!(read_data, data);
 
+    // 验证文件大小和块数
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    assert_eq!(attr.size, data.len() as u64, "File size incorrect");
+    let expected_blocks = (data.len() as u64 + 4095) / 4096; // 向上取整到4096字块
+    assert_eq!(attr.blocks, expected_blocks, "Block count incorrect");
+
     // 删除文件
     fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
 }
@@ -735,7 +741,7 @@ async fn test_write_read_and_verify_file_size() {
     let mode = 0o644;
     let umask = 0o022;
     let flags = 0;
-    let uid = 0;  // 使用root用户
+    let uid = 0;  // 使用root用
     let gid = 0;  // 使用root组
 
     // 创建文件
@@ -809,6 +815,12 @@ async fn test_write_and_read_with_overlapping_blocks() {
     assert_eq!(&read_data[..overlap_offset as usize], &data[..overlap_offset as usize], "Data before overlap should remain unchanged");
     assert_eq!(&read_data[overlap_offset as usize..(overlap_offset + overlap_data.len() as i64) as usize], &overlap_data, "Overlapped data should match written data");
     assert_eq!(&read_data[(overlap_offset + overlap_data.len() as i64) as usize..], &data[(overlap_offset + overlap_data.len() as i64) as usize..], "Data after overlap should remain unchanged");
+
+    // 验证文件大小和块数
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    assert_eq!(attr.size, data.len() as u64, "File size incorrect");
+    let expected_blocks = (data.len() as u64 + 4095) / 4096;
+    assert_eq!(attr.blocks, expected_blocks, "Block count incorrect");
 
     // 删除文件
     fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
@@ -1138,6 +1150,56 @@ async fn test_write_read_with_file_expansion_and_truncation() {
     // let read_data = fs.read_file(ino, 0, 6000, uid, gid).await.expect("Failed to read truncated file");
     // assert_eq!(&read_data[..5000], &initial_data, "Data before truncation point corrupted");
     // assert_eq!(&read_data[5000..], &vec![0; 1000], "Data after initial data should be zeros");
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_file_blocks_attribute() {
+    println!("开始测试：文件块数属性");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_blocks.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;
+    let gid = 0;
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 测试不同大小的写入
+    let test_sizes = vec![100, 512, 1000, 4096, 8192, 10000];
+
+    for &size in &test_sizes {
+        let data = vec![0xAA; size];
+        fs.write_file_blocks(ino, 0, &data, uid, gid).await.expect("Failed to write data");
+
+        let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+        assert_eq!(attr.size, size as u64, "File size incorrect for size {}", size);
+
+        let expected_blocks = (size as u64 + 4095) / 4096; // 向上取整到4096字节块
+        assert_eq!(attr.blocks, expected_blocks, "Block count incorrect for size {}", size);
+
+        println!("Size: {}, Blocks: {}, Expected Blocks: {}", size, attr.blocks, expected_blocks);
+    }
+
+    // 测试稀疏文件
+    let sparse_offset = 1_000_000; // 1MB
+    let sparse_data = vec![0xBB; 1000];
+    fs.write_file_blocks(ino, sparse_offset, &sparse_data, uid, gid).await.expect("Failed to write sparse data");
+
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    assert_eq!(attr.size, (sparse_offset + sparse_data.len() as i64) as u64, "Sparse file size incorrect");
+
+    // 计算总的预期块数：之前写入的最大数据 + 稀疏数据
+    let max_previous_size = *test_sizes.iter().max().unwrap() as u64;
+    let expected_blocks = (max_previous_size + 4095) / 4096 + (sparse_data.len() as u64 + 4095) / 4096;
+    assert_eq!(attr.blocks, expected_blocks, "Sparse file block count incorrect");
+
+    println!("Sparse file size: {}, Blocks: {}, Expected Blocks: {}", attr.size, attr.blocks, expected_blocks);
 
     // 删除文件
     fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
