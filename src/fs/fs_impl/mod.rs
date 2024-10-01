@@ -380,7 +380,7 @@ impl RedisFs {
             let write_size = std::cmp::min(data.len(), self.block_size as usize - offset_in_block as usize);
             let read_existing = attr.size > 0 && offset2blockno(offset as u64 + write_size as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
             let r= write_block(&conn, &self.logger, offset as u64, ino,
-                &data[..write_size], offset_in_block, read_existing, self.block_size).await;
+                &data[..write_size], offset_in_block, read_existing, self.block_size);
             futures_vec.push(r);
 
             offset = offset + write_size as i64;
@@ -390,7 +390,7 @@ impl RedisFs {
         while data.len() >= self.block_size as usize {
             let read_existing = attr.size > 0 && offset2blockno(offset as u64 + self.block_size as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
             let r = write_block(&conn, &self.logger, offset as u64, ino,
-                &data[..self.block_size as usize], 0, read_existing, self.block_size).await;
+                &data[..self.block_size as usize], 0, read_existing, self.block_size);
             
             futures_vec.push(r);
             offset += self.block_size as i64;
@@ -401,13 +401,13 @@ impl RedisFs {
             let read_existing = attr.size > 0 && offset2blockno(offset as u64 + data.len() as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
             slog::debug!(self.logger, "Writing last block"; "function" => "write_file_blocks", "inode" => ino, "offset" => offset, "data_len" => data.len(), "read_existing" => read_existing);
             let r = write_block(&conn, &self.logger, offset as u64, ino,
-                &data[..], 0, read_existing, self.block_size).await;
+                &data[..], 0, read_existing, self.block_size);
             futures_vec.push(r);
         }
 
         slog::debug!(self.logger, "Executing write futures"; "function" => "write_file_blocks", "future_cnt" => futures_vec.len());
-        //let write_bytes = self.execute_write_futures(futures).await?;
-        let write_bytes = futures_vec.iter().map(|r| r.unwrap()).sum::<u64>();
+        let write_bytes = self.execute_write_futures(futures_vec).await?;
+        // let write_bytes = futures_vec.iter().map(|r| r.unwrap()).sum::<u64>();
         assert!(write_bytes == data1.len() as u64, "write_bytes: {}, data_len: {}", write_bytes, data1.len());
 
         let new_size = if attr.size < offset1 as u64 + data1.len() as u64 {
