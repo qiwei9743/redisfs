@@ -1,7 +1,7 @@
 use super::*;
 use tokio;
 use std::ffi::OsString;
-use tokio::fs::remove_dir_all;
+
 use redis::AsyncCommands; // Ensure the necessary traits are in scope
 
 async fn create_test_redisfs() -> RedisFs {
@@ -635,6 +635,204 @@ async fn test_write_and_read_non_aligned_offset() {
     assert!(read_data[offset1 as usize + data1.len()..offset2 as usize].iter().all(|&x| x == 0), "Second hole (before overwrite) is not all zeros");
     assert!(read_data[offset2 as usize + data2.len()..offset3 as usize].iter().all(|&x| x == 0), "Third hole (after overwrite) is not all zeros");
     assert!(read_data[offset3 as usize + data3.len()..].iter().all(|&x| x == 0), "Hole after overwrite is not all zeros");
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_write_and_read_with_offset() {
+    println!("Starting test_write_and_read_with_offset");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_offset.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;  // 使用root用户
+    let gid = 0;  // 使用root组
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 写入初始数据
+    let initial_data = b"Hello, World!";
+    let bytes_written = fs.write_file_blocks(ino, 0, initial_data, uid, gid).await.expect("Failed to write initial data");
+    assert_eq!(bytes_written, initial_data.len() as u64);
+    
+    let data = fs.read_file(ino, 0, initial_data.len() as u32, uid, gid).await.expect("Failed to read initial data");
+    assert_eq!(data, initial_data);
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    assert_eq!(attr.size, initial_data.len() as u64);
+    
+    // 在偏移量处写入新数据
+    let offset = 7;
+    let new_data = b"Redis";
+    let bytes_written = fs.write_file_blocks(ino, offset, new_data, uid, gid).await.expect("Failed to write new data");
+    assert_eq!(bytes_written, new_data.len() as u64);
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    assert_eq!(attr.size, initial_data.len() as u64);
+
+    // 读取整个文件
+    let read_data = fs.read_file(ino, 0, (initial_data.len() + new_data.len()) as u32, uid, gid).await.expect("Failed to read file");
+    
+    // 验证数据
+    let expected_data = b"Hello, Redis!";
+    assert_eq!(read_data, expected_data);
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_write_beyond_file_size() {
+    println!("Starting test_write_beyond_file_size");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_beyond.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;  // 使用root用户
+    let gid = 0;  // 使用root组
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 写入初始数据
+    let initial_data = b"Short";
+    let bytes_written = fs.write_file_blocks(ino, 0, initial_data, uid, gid).await.expect("Failed to write initial data");
+    assert_eq!(bytes_written, initial_data.len() as u64);
+
+    // 在文件末尾之后写入新数据
+    let offset = 10;
+    let new_data = b"Long data";
+    let bytes_written = fs.write_file_blocks(ino, offset, new_data, uid, gid).await.expect("Failed to write new data");
+    assert_eq!(bytes_written, new_data.len() as u64);
+
+    // 读取整个文件
+    let read_data = fs.read_file(ino, 0, (offset + new_data.len() as i64) as u32, uid, gid).await.expect("Failed to read file");
+    
+    // 验证数据
+    let mut expected_data = vec![0; offset as usize];
+    expected_data[..initial_data.len()].copy_from_slice(initial_data);
+    expected_data.extend_from_slice(new_data);
+    assert_eq!(read_data, expected_data);
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_multiple_writes_and_reads() {
+    println!("Starting test_multiple_writes_and_reads");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_multiple.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;  // 使用root用户
+    let gid = 0;  // 使用root组
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 多次写入数据
+    let data1 = b"First ";
+    let data2 = b"Second ";
+    let data3 = b"Third";
+
+    fs.write_file_blocks(ino, 0, data1, uid, gid).await.expect("Failed to write data1");
+    fs.write_file_blocks(ino, data1.len() as i64, data2, uid, gid).await.expect("Failed to write data2");
+    fs.write_file_blocks(ino, (data1.len() + data2.len()) as i64, data3, uid, gid).await.expect("Failed to write data3");
+
+    // 读取整个文件
+    let read_data = fs.read_file(ino, 0, (data1.len() + data2.len() + data3.len()) as u32, uid, gid).await.expect("Failed to read file");
+    
+    // 验证数据
+    let expected_data = b"First Second Third";
+    assert_eq!(read_data, expected_data);
+
+    // 部分读取
+    let partial_read = fs.read_file(ino, 6, 6, uid, gid).await.expect("Failed to perform partial read");
+    assert_eq!(partial_read, b"Second");
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_write_and_read_large_file_with_holes() {
+    println!("Starting test_write_and_read_large_file_with_holes");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_large_holes.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;  // 使用root用户
+    let gid = 0;  // 使用root组
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 写入大文件，包含空洞
+    let data1 = vec![1u8; 4096]; // 4KB
+    let data2 = vec![2u8; 4096]; // 4KB
+    let hole_size = 1024 * 1024; // 1MB
+
+    fs.write_file_blocks(ino, 0, &data1, uid, gid).await.expect("Failed to write data1");
+    fs.write_file_blocks(ino, (data1.len() + hole_size) as i64, &data2, uid, gid).await.expect("Failed to write data2");
+
+    // 读取整个文件
+    let read_data = fs.read_file(ino, 0, (data1.len() + hole_size + data2.len()) as u32, uid, gid).await.expect("Failed to read file");
+    
+    // 验证数据
+    assert_eq!(read_data[..data1.len()], data1);
+    assert_eq!(read_data[data1.len()..data1.len() + hole_size], vec![0u8; hole_size]);
+    assert_eq!(read_data[data1.len() + hole_size..], data2);
+
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}
+
+#[tokio::test]
+async fn test_write_read_and_verify_file_size() {
+    println!("Starting test_write_read_and_verify_file_size");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_file_size.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;  // 使用root用户
+    let gid = 0;  // 使用root组
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 写入数据
+    let data = b"Hello, World! This is a test file.";
+    let bytes_written = fs.write_file_blocks(ino, 0, data, uid, gid).await.expect("Failed to write file");
+    assert_eq!(bytes_written, data.len() as u64);
+
+    // 获取文件属性
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    println!("File size after write: {} bytes", attr.size);
+
+    // 验证文件大小
+    assert_eq!(attr.size, data.len() as u64, "File size does not match written data length");
+
+    // 读取文件内容
+    let read_data = fs.read_file(ino, 0, attr.size as u32, uid, gid).await.expect("Failed to read file");
+
+    // 验证文件内容
+    assert_eq!(read_data, data, "Read data does not match written data");
+
+    // 再次获取文件属性，确保大小没有变化
+    let attr_after_read = fs.get_attr(ino).await.expect("Failed to get file attributes after read");
+    assert_eq!(attr_after_read.size, attr.size, "File size changed after read");
+
     // 删除文件
     fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
 }

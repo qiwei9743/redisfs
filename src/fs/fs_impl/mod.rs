@@ -357,8 +357,9 @@ impl RedisFs {
         Ok(data)
     }
 
-    pub async fn write_file_blocks(&self, ino: u64, mut offset: i64, data1: &[u8], uid: u32, gid: u32) -> Result<u64, i32> {
+    pub async fn write_file_blocks(&self, ino: u64, offset1: i64, data1: &[u8], uid: u32, gid: u32) -> Result<u64, i32> {
         let mut data = data1;
+        let mut offset = offset1;
         let attr = self.get_attr(ino).await?;
         let conn = self.redis_client.clone();
         if !self.check_permission(&attr, uid, gid, 2) {
@@ -403,8 +404,8 @@ impl RedisFs {
         let write_bytes = self.execute_write_futures(futures).await?;
         assert!(write_bytes == data1.len() as u64, "write_bytes: {}, data_len: {}", write_bytes, data1.len());
 
-        let new_size = if attr.size < offset as u64 + data1.len() as u64 {
-            Some(offset as u64 + data1.len() as u64)
+        let new_size = if attr.size < offset1 as u64 + data1.len() as u64 {
+            Some(offset1 as u64 + data1.len() as u64)
         } else {
             None
         };
