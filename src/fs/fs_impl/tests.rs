@@ -551,3 +551,90 @@ async fn test_sparse_write_and_read() {
     // Delete file
     fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
 }
+
+#[tokio::test]
+async fn test_write_and_read_non_aligned_offset() {
+    println!("Starting test_write_and_read_non_aligned_offset");
+    let fs = create_test_redisfs().await;
+    let parent = 1; // 根目录
+    let name = OsString::from("test_non_aligned_offset.txt");
+    let mode = 0o644;
+    let umask = 0o022;
+    let flags = 0;
+    let uid = 0;  // 使用root用户
+    let gid = 0;  // 使用root组
+
+    // 创建文件
+    let (ino, _) = fs.create_file(parent, &name, mode, umask, flags, uid, gid).await.expect("Failed to create file");
+
+    // 写入初始数据
+    let initial_data = b"Initial data";
+    fs.write_file_blocks(ino, 0, initial_data, uid, gid).await.expect("Failed to write initial data");
+    println!("Initial data written: {:?}", initial_data);
+
+    // 立即验证初始数据
+    let read_initial = fs.read_file(ino, 0, initial_data.len() as u32, uid, gid).await.expect("Failed to read initial data");
+    println!("Initial data read: {:?}", read_initial);
+    assert_eq!(read_initial, initial_data, "Initial data verification failed");
+
+    // 获取文件属性
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    println!("File size after initial write: {}", attr.size);
+
+    // 在非对齐偏移量2000处写入数据
+    let offset1 = 2000;
+    let data1 = b"First non-aligned write test";
+    fs.write_file_blocks(ino, offset1, data1, uid, gid).await.expect("Failed to write file at first non-aligned offset");
+    println!("Data1 written at offset {}: {:?}", offset1, data1);
+
+    // 立即验证第一次写入
+    let read_data_initial = fs.read_file(ino, 0, initial_data.len() as u32, uid, gid).await.expect("Failed to read first non-aligned data");
+    println!("Data1 read: {:?}", read_data_initial);
+    assert_eq!(read_data_initial, initial_data, "First non-aligned write verification failed");
+
+    // 验证第一次写入
+    let read_data1 = fs.read_file(ino, offset1, data1.len() as u32, uid, gid).await.expect("Failed to read first non-aligned data");
+    println!("Data1 read: {:?}", read_data1);
+    assert_eq!(read_data1, data1, "First non-aligned write verification failed");
+
+    // 在非对齐偏移量3000处写入数据
+    let offset2 = 3000;
+    let data2 = b"Second non-aligned write test";
+    fs.write_file_blocks(ino, offset2, data2, uid, gid).await.expect("Failed to write file at second non-aligned offset");
+    println!("Data2 written at offset {}: {:?}", offset2, data2);
+
+    // 验证第二次写入
+    let read_data2 = fs.read_file(ino, offset2, data2.len() as u32, uid, gid).await.expect("Failed to read second non-aligned data");
+    println!("Data2 read: {:?}", read_data2);
+    assert_eq!(read_data2, data2, "Second non-aligned write verification failed");
+
+    // Overwrite part of the hole
+    let data3 = b"Overwriting hole";
+    let offset3 = 4096i64; // In the middle of the hole
+    fs.write_file_blocks(ino, offset3, data3, uid, gid).await.expect("Failed to write third chunk");
+    println!("Data3 written at offset {}: {:?}", offset3, data3);
+
+    // Get updated file attributes
+    let attr = fs.get_attr(ino).await.expect("Failed to get file attributes");
+    let file_size = attr.size;
+    println!("File size after all writes: {}", file_size);
+
+    // Read entire file again
+    let read_data = fs.read_file(ino, 0, file_size as u32, uid, gid).await.expect("Failed to read entire file");
+    //println!("Full file content: {:?}", read_data);
+    println!("Read data length: {}", read_data.len());
+
+    // Verify all data
+    assert_eq!(&read_data[..initial_data.len()], initial_data, "Initial data in full read doesn't match");
+    assert_eq!(&read_data[offset1 as usize..offset1 as usize + data1.len()], data1, "First non-aligned data in full read doesn't match");
+    assert_eq!(&read_data[offset3 as usize..offset3 as usize + data3.len()], data3, "Third data (overwriting hole) in full read doesn't match");
+    assert_eq!(&read_data[offset2 as usize..offset2 as usize + data2.len()], data2, "Second non-aligned data in full read doesn't match");
+
+    // Verify remaining holes
+    assert!(read_data[initial_data.len()..offset1 as usize].iter().all(|&x| x == 0), "First hole is not all zeros");
+    assert!(read_data[offset1 as usize + data1.len()..offset2 as usize].iter().all(|&x| x == 0), "Second hole (before overwrite) is not all zeros");
+    assert!(read_data[offset2 as usize + data2.len()..offset3 as usize].iter().all(|&x| x == 0), "Third hole (after overwrite) is not all zeros");
+    assert!(read_data[offset3 as usize + data3.len()..].iter().all(|&x| x == 0), "Hole after overwrite is not all zeros");
+    // 删除文件
+    fs.remove_file(parent, &name, uid, gid).await.expect("Failed to remove file");
+}

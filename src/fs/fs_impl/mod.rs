@@ -38,6 +38,10 @@ impl Clone for RedisFs {
     }
 }
 
+fn offset2blockno(offset: u64, block_size: u64) -> u64 {
+    (offset as u64) / block_size
+}
+
 async fn write_block(conn: &ConnectionManager, logger: &Logger, 
         offset: u64, ino: u64, data: &[u8], offset_in_block: u64, read_existing: bool, block_size: u64) -> Result<u64, i32> {
     let block_key = metadata::inode_block_key(ino, offset / block_size);
@@ -369,7 +373,7 @@ impl RedisFs {
             // handle first block if it's not ful filled a block.
             let offset_in_block = offset as u64 % self.block_size;
             let write_size = std::cmp::min(data.len(), self.block_size as usize - offset_in_block as usize);
-            let read_existing = (offset as u64 + write_size as u64) < attr.size;
+            let read_existing = attr.size > 0 && offset2blockno(offset as u64 + write_size as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
             let r= write_block(&conn, &self.logger, offset as u64, ino,
                 &data[..write_size], offset_in_block, read_existing, self.block_size);
             futures.push(r);
@@ -379,7 +383,7 @@ impl RedisFs {
         }
 
         while data.len() >= self.block_size as usize {
-            let read_existing = (offset as u64 + self.block_size) < attr.size;
+            let read_existing = attr.size > 0 && offset2blockno(offset as u64 + self.block_size as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
             let r = write_block(&conn, &self.logger, offset as u64, ino,
                 &data[..self.block_size as usize], 0, read_existing, self.block_size);
             
@@ -389,7 +393,7 @@ impl RedisFs {
         }
         if data.len() > 0 {
             // handle last block
-            let read_existing = (offset as u64 + data.len() as u64) < attr.size;
+            let read_existing = attr.size > 0 && offset2blockno(offset as u64 + data.len() as u64 - 1, self.block_size) <= offset2blockno(attr.size - 1, self.block_size);
             let r = write_block(&conn, &self.logger, offset as u64, ino,
                 &data[..], 0, read_existing, self.block_size);
             futures.push(r);
